@@ -1,0 +1,13 @@
+{
+  "name": "whsl-drops-order-alert",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Daily check: Wholesale WIP styles moved to Dropped -> matching not-fulfilled NetSuite wholesale orders -> Monday pulse on Wholesale Sales L10.",
+  "scripts": {
+    "start": "node scripts/run.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
