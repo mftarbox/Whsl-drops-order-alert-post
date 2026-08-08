@@ -36,7 +36,7 @@ export async function getAssets(assetIds) {
   if (!assetIds.length) return [];
   const data = await mondayGraphQL(
     `
-    query ($ids: [ID!]) {
+    query ($ids: [ID!]!) {
       assets(ids: $ids) {
         id
         name
