@@ -131,7 +131,6 @@ async function findMatchingOrderLines(masterSku) {
       so.entity AS customer_id,
       sol.item AS item_id,
       item.custitem8 AS master_sku,
-      item.itemtype AS item_type,
       ABS(sol.quantity) AS qty_ordered,
       COALESCE(ABS(shipped.qty_shipped), 0) AS qty_shipped
     FROM transaction so
@@ -151,69 +150,6 @@ async function findMatchingOrderLines(masterSku) {
       AND ABS(sol.quantity) > COALESCE(ABS(shipped.qty_shipped), 0)
   `;
   return runSuiteQL(sql);
-}
-
-// NetSuite's REST record API has no generic "item" endpoint - each item subtype needs its own
-// endpoint name (confirmed: /record/v1/item 404s with "Record type 'item' does not exist").
-// All Wholesale-relevant items seen so far are InvtPart ("inventoryitem"), but this maps the
-// other common subtypes too and falls back to inventoryitem if something unexpected shows up.
-const ITEM_TYPE_TO_RECORD_TYPE = {
-  InvtPart: 'inventoryitem',
-  NonInvtPart: 'noninventoryitem',
-  Assembly: 'assemblyitem',
-  Kit: 'kititem',
-  Group: 'itemgroup',
-  Service: 'serviceitem',
-};
-
-function recordTypeForItemType(itemType) {
-  return ITEM_TYPE_TO_RECORD_TYPE[itemType] || 'inventoryitem';
-}
-
-// Shopify title = custitem_nu_sales_title, variant size = custitem35, sort position = custitem42
-// (all confirmed with Shelly on 2026-08-07 against a real item record - see docs/spec.md
-// decision 15). Items missing a position sort last rather than breaking the sort.
-async function getItemDetails(itemId, itemType) {
-  try {
-    const rec = await getRecord(recordTypeForItemType(itemType), itemId, [
-      'custitem_nu_sales_title',
-      'custitem35',
-      'custitem42',
-    ]);
-    const position = Number(rec.custitem42);
-    return {
-      shopifyTitle: rec.custitem_nu_sales_title || '(no title on file)',
-      size: rec.custitem35?.refName || '(no size on file)',
-      position: Number.isFinite(position) ? position : Number.MAX_SAFE_INTEGER,
-    };
-  } catch (err) {
-    console.warn(`  Could not fetch item details for item ${itemId}: ${err.message}`);
-    return { shopifyTitle: '(unknown)', size: '(unknown)', position: Number.MAX_SAFE_INTEGER };
-  }
-}
-
-function buildNetSuiteOrderUrl(soInternalId) {
-  const accountId = process.env.NETSUITE_ACCOUNT_ID;
-  return `https://${accountId}.app.netsuite.com/app/accounting/transactions/salesord.nl?id=${soInternalId}`;
-}
-
-// Builds the rich comment posted to the pulse (both on first creation and on every later
-// append) - see docs/spec.md decision 15. Only reflects drops found in *this* run, per Shelly's
-// call on 2026-08-07 (not a full cumulative history across every past alert on this order).
-function buildCommentBody({ orderNumber, customerName, soInternalId, skuRows, variantRows }) {
-  const skuLines = skuRows.map((r) => `${r.masterSku} | ${r.shopifyTitle}`).join('<br>');
-  const variantLines = variantRows.map((r) => `${r.size} | ${r.qtyOrdered}`).join('<br>');
-  return [
-    `<b>Order:</b> ${orderNumber}`,
-    `<b>Customer:</b> ${customerName}`,
-    `<b>NetSuite Sales Order:</b> ${buildNetSuiteOrderUrl(soInternalId)}`,
-    '',
-    '<b>Dropped Master SKU | Shopify Title</b>',
-    skuLines,
-    '',
-    '<b>Variant Size | Qty Ordered</b>',
-    variantLines,
-  ].join('<br>');
 }
 
 async function getCustomerName(customerId) {
@@ -270,22 +206,21 @@ async function getMondayUserByEmail(email) {
   return data.users?.[0] || null;
 }
 
-async function postComment(pulseId, commentBody) {
-  await mondayGraphQL(
-    `
-    mutation ($itemId: ID!, $body: String!) {
-      create_update(item_id: $itemId, body: $body) { id }
-    }
-    `,
-    { itemId: pulseId, body: commentBody },
-  );
-}
-
-async function createOrUpdatePulse({ orderNumber, customerName, personMondayId, commentBody }, state) {
+async function createOrUpdatePulse({ orderNumber, customerName, personMondayId }, state) {
   const existing = state[orderNumber];
 
   if (existing?.pulseId) {
-    await postComment(existing.pulseId, commentBody);
+    await mondayGraphQL(
+      `
+      mutation ($itemId: ID!, $body: String!) {
+        create_update(item_id: $itemId, body: $body) { id }
+      }
+      `,
+      {
+        itemId: existing.pulseId,
+        body: `Another dropped style now affects this order (flagged ${new Date().toISOString().slice(0, 10)}).`,
+      },
+    );
     console.log(`  Appended update to existing pulse ${existing.pulseId} for order ${orderNumber}.`);
     return existing.pulseId;
   }
@@ -314,8 +249,6 @@ async function createOrUpdatePulse({ orderNumber, customerName, personMondayId, 
   const newPulseId = data.create_item.id;
   state[orderNumber] = { pulseId: newPulseId, createdAt: new Date().toISOString() };
   console.log(`  Created pulse ${newPulseId} for order ${orderNumber} ("${itemName}").`);
-
-  await postComment(newPulseId, commentBody);
   return newPulseId;
 }
 
@@ -359,11 +292,6 @@ async function main() {
   const droppedItems = candidates.filter((c) => indicators[c.wip2027Id] === 'Dropped');
   console.log(`${droppedItems.length} item(s) newly Dropped.`);
 
-  // Aggregate every matching line across ALL dropped styles found in this run, grouped by
-  // order - so if two styles drop in the same run and both hit the same order, that order gets
-  // one combined comment instead of two separate ones (per Shelly's call on 2026-08-07).
-  const orderMatches = new Map();
-
   for (const item of droppedItems) {
     console.log(`Processing dropped style: ${item.name} (Master SKU ${item.masterSku || '(none)'})`);
 
@@ -381,22 +309,28 @@ async function main() {
     }
     console.log(`  ${rows.length} matching not-fulfilled order line(s) found.`);
 
-    for (const row of rows) {
-      if (!orderMatches.has(row.order_number)) {
-        orderMatches.set(row.order_number, {
-          soInternalId: row.so_internal_id,
-          customerId: row.customer_id,
-          skuMap: new Map(),
-          variantRows: [],
-        });
-      }
-      const agg = orderMatches.get(row.order_number);
-      const details = await getItemDetails(row.item_id, row.item_type);
+    const orderIds = [...new Set(rows.map((r) => r.so_internal_id))];
+    for (const soId of orderIds) {
+      const row = rows.find((r) => r.so_internal_id === soId);
+      const orderNumber = row.order_number;
 
-      if (!agg.skuMap.has(row.master_sku)) {
-        agg.skuMap.set(row.master_sku, { shopifyTitle: details.shopifyTitle });
+      try {
+        const customerName = await getCustomerName(row.customer_id);
+        const email = await resolvePersonEmail(soId);
+        const mondayUser = await getMondayUserByEmail(email);
+
+        if (email && !mondayUser) {
+          console.warn(`  No Monday user found for email ${email} - pulse will be created with no assignee.`);
+        }
+
+        await createOrUpdatePulse(
+          { orderNumber, customerName, personMondayId: mondayUser?.id },
+          state,
+        );
+        saveState(state);
+      } catch (err) {
+        console.error(`  Failed to process order ${orderNumber}: ${err.message}`);
       }
-      agg.variantRows.push({ size: details.size, qtyOrdered: row.qty_ordered, position: details.position });
     }
 
     try {
@@ -404,39 +338,6 @@ async function main() {
       console.log(`  Marked "Rework Alert Sent" on ${item.name}.`);
     } catch (err) {
       console.error(`  Failed to check "Rework Alert Sent" on ${item.name}: ${err.message}`);
-    }
-  }
-
-  for (const [orderNumber, agg] of orderMatches) {
-    try {
-      const customerName = await getCustomerName(agg.customerId);
-      const email = await resolvePersonEmail(agg.soInternalId);
-      const mondayUser = await getMondayUserByEmail(email);
-
-      if (email && !mondayUser) {
-        console.warn(`  No Monday user found for email ${email} - pulse will be created with no assignee.`);
-      }
-
-      const skuRows = [...agg.skuMap.entries()].map(([masterSku, v]) => ({
-        masterSku,
-        shopifyTitle: v.shopifyTitle,
-      }));
-      const variantRows = [...agg.variantRows].sort((a, b) => a.position - b.position);
-      const commentBody = buildCommentBody({
-        orderNumber,
-        customerName,
-        soInternalId: agg.soInternalId,
-        skuRows,
-        variantRows,
-      });
-
-      await createOrUpdatePulse(
-        { orderNumber, customerName, personMondayId: mondayUser?.id, commentBody },
-        state,
-      );
-      saveState(state);
-    } catch (err) {
-      console.error(`  Failed to process order ${orderNumber}: ${err.message}`);
     }
   }
 
