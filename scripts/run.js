@@ -1,22 +1,27 @@
 // Daily check: Wholesale WIP styles moved to "Dropped" -> matching not-fulfilled NetSuite
 // wholesale orders (by Master SKU) -> create/update a Monday pulse on Wholesale Sales L10.
-//
-// See docs/spec.md for the full design and the reasoning behind each piece below.
-// This is the first version of this script - it has NOT yet been run against production
-// secrets. Expect to need a debugging pass on the first real (or manually triggered) run.
+// Plus three related features that piggyback on the same daily run (see docs/spec.md for the
+// full design and reasoning behind each piece):
+//   1. Side effect of a drop: Wholesale WIP's "Add to NuOrder" flips to "Remove".
+//   2. Side effect of a drop: a "close these order lines" CSV pulse on Sales Ops L10.
+//   3. Independent trigger: Wholesale WIP items at "Add to NuOrder" = "Add" get their WIP2027
+//      images exported to the NuOrder Imagery Dropbox folder.
+//   4. Slack alerts to #whsl_ops_workflow_alerts on both fatal and per-item/per-order errors.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mondayGraphQL } from './lib/monday.js';
-import { runSuiteQL, getRecord } from './lib/netsuite.js';
+import { mondayGraphQL, getAssets, mondayUploadFile } from './lib/monday.js';
+import { runSuiteQL, getRecord, getSalesOrderLines } from './lib/netsuite.js';
+import { uploadFile as uploadToDropbox } from './lib/dropbox.js';
+import { sendSlackAlert } from './lib/slack.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_PATH = path.join(__dirname, '..', 'state', 'state.json');
 
-// --- Board / column IDs (verified live against the actual boards on 2026-08-07) ---
+// --- Board / column IDs (verified live against the actual boards on 2026-08-07/08) ---
 const WHOLESALE_WIP_BOARD = 18419234689;
-const WIP2027_BOARD = 18388071004; // not queried directly here except by item id, see below
+const WIP2027_BOARD = 18388071004;
 const L10_BOARD = 3552781534;
 const L10_GROUP = 'new_group_mkn8x1ye'; // "Wholesale Order Board"
 const L10_PERSON_COLUMN = 'person';
@@ -25,10 +30,32 @@ const COL_BOARD_RELATION = 'board_relation_mm5z9qmh'; // Wholesale WIP -> WIP202
 const COL_MASTER_SKU = 'formula_mm5z9x2x'; // Wholesale WIP Master SKU (already includes 800-swap)
 const COL_REWORK_CHECKBOX = 'boolean_mm60zwwz'; // "Rework Alert Sent" on Wholesale WIP
 const COL_PLANNING_INDICATOR = 'status_1__1'; // Planning Indicator, read from WIP2027 directly
+const COL_ADD_TO_NUORDER = 'color_mm5zz20q'; // Wholesale WIP "Add to NuOrder" status (Add/Remove/Synced)
 // NOTE: Wholesale WIP also has a Planning Indicator column, but it's a "lookup"/mirror type,
 // which monday.com's API cannot read or filter on at all (confirmed directly against the
 // account). That's why this script reads status_1__1 on WIP2027 instead, using the
-// board_relation link above to know which WIP2027 items are wholesale-relevant.
+// board_relation link above to know which WIP2027 items are wholesale-relevant. The same
+// limitation applies to Wholesale WIP's own Image column, which is why feature 3 below reads
+// WIP2027's real files2__1 field instead.
+
+const COL_WIP2027_IMAGE = 'files2__1'; // WIP2027 Image column (the real field - see note above)
+const COL_WIP2027_IMAGES_EXPORTED = 'boolean_mm61mp3r'; // WIP2027 "NuOrder Images Exported" checkbox
+// The "New Pic!" button (button_mm615zp0, also on WIP2027) isn't read by this script at all - it's
+// wired via a native monday board automation that unchecks COL_WIP2027_IMAGES_EXPORTED directly,
+// which is what actually causes this script to re-detect and re-export on its next run.
+
+const SALES_OPS_BOARD = 7017226460;
+const SALES_OPS_GROUP = 'new_group72329__1'; // "ToDo"
+const SALES_OPS_PRIORITY_COLUMN = 'status_1_mkm2z4qr';
+const SALES_OPS_PRIORITY_HIGH_LABEL = 'High Priority';
+const NETSUITE_CLOSE_ITEMS_IMPORT_URL =
+  'https://4775967.app.netsuite.com/app/setup/assistants/nsimport/importassistant.nl?recid=235&new=T';
+
+// Confirmed live on 2026-08-08 by resolving Shelly's original share link's folder name against
+// a full account-wide Dropbox search - there's a second, unrelated "NuOrder Imagery" folder
+// nested under /Apps/nuorder-imagery-netsuite-sync from an earlier integration attempt; this is
+// deliberately NOT that one.
+const DROPBOX_IMAGERY_FOLDER = '/NuOrder Imagery';
 
 const isManualRun = process.env.GITHUB_EVENT_NAME === 'workflow_dispatch';
 
@@ -86,7 +113,10 @@ async function getWholesaleWipItems() {
       }
     }
     `,
-    { boardId: WHOLESALE_WIP_BOARD, columnIds: [COL_BOARD_RELATION, COL_MASTER_SKU, COL_REWORK_CHECKBOX] },
+    {
+      boardId: WHOLESALE_WIP_BOARD,
+      columnIds: [COL_BOARD_RELATION, COL_MASTER_SKU, COL_REWORK_CHECKBOX, COL_ADD_TO_NUORDER],
+    },
   );
 
   return data.boards[0].items_page.items.map((item) => {
@@ -97,6 +127,7 @@ async function getWholesaleWipItems() {
       wip2027Id: cv[COL_BOARD_RELATION]?.linked_item_ids?.[0],
       masterSku: cv[COL_MASTER_SKU]?.display_value || cv[COL_MASTER_SKU]?.text,
       reworkAlertSent: isChecked(cv[COL_REWORK_CHECKBOX]),
+      addToNuOrder: cv[COL_ADD_TO_NUORDER]?.text || null,
     };
   });
 }
@@ -121,6 +152,27 @@ async function getPlanningIndicators(itemIds) {
     map[item.id] = item.column_values[0]?.text;
   }
   return map;
+}
+
+// --- Feature 1: Add to NuOrder -> Remove -------------------------------------------------
+// Unconditional side effect of a style dropping - fires regardless of whether any NetSuite
+// orders end up matching, and before the Wholesale L10 / Sales Ops L10 pulses. The existing
+// Celigo integration then automatically unchecks NetSuite's "NuOrder Active" checkbox on the
+// matching item(s) on its own - nothing to build for that part.
+async function setAddToNuOrderToRemove(itemId) {
+  await mondayGraphQL(
+    `
+    mutation ($boardId: ID!, $itemId: ID!, $columnId: String!, $value: JSON!) {
+      change_column_value(board_id: $boardId, item_id: $itemId, column_id: $columnId, value: $value) { id }
+    }
+    `,
+    {
+      boardId: WHOLESALE_WIP_BOARD,
+      itemId,
+      columnId: COL_ADD_TO_NUORDER,
+      value: JSON.stringify({ label: 'Remove' }),
+    },
+  );
 }
 
 async function findMatchingOrderLines(masterSku) {
@@ -188,6 +240,7 @@ async function getItemDetails(itemId, itemType) {
     };
   } catch (err) {
     console.warn(`  Could not fetch item details for item ${itemId}: ${err.message}`);
+    await sendSlackAlert(`Could not fetch item details for NetSuite item ${itemId}: ${err.message}`);
     return { shopifyTitle: '(unknown)', size: '(unknown)', position: Number.MAX_SAFE_INTEGER };
   }
 }
@@ -222,6 +275,7 @@ async function getCustomerName(customerId) {
     return cust.entityId || `Customer ${customerId}`;
   } catch (err) {
     console.warn(`  Could not fetch customer ${customerId}: ${err.message}`);
+    await sendSlackAlert(`Could not fetch NetSuite customer ${customerId}: ${err.message}`);
     return `Customer ${customerId}`;
   }
 }
@@ -288,7 +342,7 @@ async function getPulseState(pulseId) {
 }
 
 async function postComment(pulseId, commentBody) {
-  await mondayGraphQL(
+  const data = await mondayGraphQL(
     `
     mutation ($itemId: ID!, $body: String!) {
       create_update(item_id: $itemId, body: $body) { id }
@@ -296,6 +350,7 @@ async function postComment(pulseId, commentBody) {
     `,
     { itemId: pulseId, body: commentBody },
   );
+  return data.create_update.id;
 }
 
 async function createOrUpdatePulse({ orderNumber, customerName, personMondayId, commentBody }, state) {
@@ -360,6 +415,218 @@ async function markReworkAlertSent(itemId) {
   );
 }
 
+// --- Feature 2: Sales Ops L10 "close items" CSV pulse ------------------------------------
+// Reuses the exact same NetSuite rows already fetched for the Wholesale L10 rep pulses (see
+// main()) - no separate matching query. Per matched order line we additionally need "Closed"
+// and "Line ID" (= Line Unique Key), which come from a NetSuite record-level fetch of that
+// order's item sublist (see lib/netsuite.js getSalesOrderLines) rather than another SuiteQL
+// call, since both fields error out via bulk SuiteQL in this account. Cached per order for the
+// life of a run, and each line is only ever handed out once (queued by item id) so two rows
+// referencing the exact same item on an order can't both grab the same underlying line.
+async function resolveOrderLineDetails(soInternalId, itemId, lineQueueCache) {
+  if (!lineQueueCache.has(soInternalId)) {
+    let lines = [];
+    try {
+      lines = await getSalesOrderLines(soInternalId);
+    } catch (err) {
+      console.warn(`  Could not fetch line details for order ${soInternalId}: ${err.message}`);
+      await sendSlackAlert(
+        `Could not fetch NetSuite line details (isClosed/Line ID) for order internal id ${soInternalId}: ${err.message}`,
+      );
+    }
+    const queueByItem = new Map();
+    for (const line of lines) {
+      const key = String(line.itemId);
+      if (!queueByItem.has(key)) queueByItem.set(key, []);
+      queueByItem.get(key).push(line);
+    }
+    lineQueueCache.set(soInternalId, queueByItem);
+  }
+
+  const queueByItem = lineQueueCache.get(soInternalId);
+  const queue = queueByItem.get(String(itemId));
+  if (!queue || queue.length === 0) return null;
+  return queue.shift();
+}
+
+function buildCloseItemsCsv(rows) {
+  const header = 'Internal ID,Closed,Line ID';
+  const lines = rows.map((r) => `${r.internalId},${r.closed},${r.lineId}`);
+  return [header, ...lines].join('\n') + '\n';
+}
+
+async function createSalesOpsCsvPulse(masterSku, csvRows) {
+  const itemName = `${masterSku} dropped - Close items on Sales Orders`;
+  const columnValues = {
+    [SALES_OPS_PRIORITY_COLUMN]: { label: SALES_OPS_PRIORITY_HIGH_LABEL },
+  };
+
+  const data = await mondayGraphQL(
+    `
+    mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $columnValues: JSON!) {
+      create_item(board_id: $boardId, group_id: $groupId, item_name: $itemName, column_values: $columnValues) {
+        id
+      }
+    }
+    `,
+    {
+      boardId: SALES_OPS_BOARD,
+      groupId: SALES_OPS_GROUP,
+      itemName,
+      columnValues: JSON.stringify(columnValues),
+    },
+  );
+  const pulseId = data.create_item.id;
+
+  const commentBody = [
+    `<b>${masterSku}</b> dropped - the attached CSV lists every affected sales order line to close in NetSuite.`,
+    '',
+    `Close Sales Order Items CSV Import mapping: <a href="${NETSUITE_CLOSE_ITEMS_IMPORT_URL}">${NETSUITE_CLOSE_ITEMS_IMPORT_URL}</a>`,
+  ].join('<br>');
+  const updateId = await postComment(pulseId, commentBody);
+
+  const csvContent = buildCloseItemsCsv(csvRows);
+  await mondayUploadFile({
+    query: `mutation ($file: File!) { add_file_to_update (update_id: ${updateId}, file: $file) { id } }`,
+    fieldName: 'variables[file]',
+    filename: `${masterSku}-close-items.csv`,
+    buffer: Buffer.from(csvContent, 'utf8'),
+    mimeType: 'text/csv',
+  });
+
+  console.log(`  Created Sales Ops L10 pulse ${pulseId} for "${masterSku}" with ${csvRows.length} line(s).`);
+  return pulseId;
+}
+
+// --- Feature 3: NuOrder imagery export to Dropbox -----------------------------------------
+// Independent of the Dropped trigger above - runs every time this script runs (same 8pm
+// Mountain cadence), gated purely on Wholesale WIP's real "Add to NuOrder" status column and
+// WIP2027's own "NuOrder Images Exported" checkbox (idempotency + re-trigger, see docs/spec.md).
+async function getWip2027ImageExportState(itemIds) {
+  if (itemIds.length === 0) return {};
+  const data = await mondayGraphQL(
+    `
+    query ($itemIds: [ID!]) {
+      items(ids: $itemIds) {
+        id
+        column_values(ids: ["${COL_WIP2027_IMAGES_EXPORTED}", "${COL_WIP2027_IMAGE}"]) {
+          id
+          value
+          ... on CheckboxValue { checked }
+        }
+      }
+    }
+    `,
+    { itemIds },
+  );
+
+  const map = {};
+  for (const item of data.items) {
+    const cv = Object.fromEntries(item.column_values.map((c) => [c.id, c]));
+    let files = [];
+    try {
+      const parsed = cv[COL_WIP2027_IMAGE]?.value ? JSON.parse(cv[COL_WIP2027_IMAGE].value) : null;
+      files = parsed?.files || [];
+    } catch {
+      files = [];
+    }
+    map[item.id] = {
+      imagesExported: isChecked(cv[COL_WIP2027_IMAGES_EXPORTED]),
+      files,
+    };
+  }
+  return map;
+}
+
+async function markImagesExported(wip2027Id) {
+  await mondayGraphQL(
+    `
+    mutation ($boardId: ID!, $itemId: ID!, $columnId: String!, $value: JSON!) {
+      change_column_value(board_id: $boardId, item_id: $itemId, column_id: $columnId, value: $value) { id }
+    }
+    `,
+    {
+      boardId: WIP2027_BOARD,
+      itemId: wip2027Id,
+      columnId: COL_WIP2027_IMAGES_EXPORTED,
+      value: JSON.stringify({ checked: 'true' }),
+    },
+  );
+}
+
+// Exports every image in WIP2027's Image column, renamed to "{Master SKU}-0{sequence}.{ext}"
+// (e.g. "10176-3232-01.png", confirmed with Shelly against real filenames on 2026-08-07 - the
+// convention is a literal "0" + a single-digit sequence, since up to 5 images is the practical
+// max). Sequence follows the order files appear in the column (upload order). Binary content,
+// file type, and file size pass through completely untouched - only the filename changes.
+async function exportImagesToDropbox(target, files) {
+  const assetIds = files.map((f) => String(f.assetId));
+  const assets = await getAssets(assetIds);
+  const assetById = Object.fromEntries(assets.map((a) => [a.id, a]));
+
+  for (let i = 0; i < files.length; i++) {
+    const fileRef = files[i];
+    const asset = assetById[String(fileRef.assetId)];
+    if (!asset) {
+      throw new Error(`Could not resolve asset metadata for asset id ${fileRef.assetId}`);
+    }
+
+    const res = await fetch(asset.public_url);
+    if (!res.ok) {
+      throw new Error(`Failed to download asset ${fileRef.assetId} (${res.status})`);
+    }
+    const buffer = Buffer.from(await res.arrayBuffer());
+
+    const ext = asset.file_extension || '';
+    const filename = `${target.masterSku}-0${i + 1}${ext}`;
+
+    await uploadToDropbox(`${DROPBOX_IMAGERY_FOLDER}/${filename}`, buffer);
+  }
+}
+
+async function processNuOrderImageExports(wipItems) {
+  const targets = wipItems.filter((i) => i.addToNuOrder === 'Add' && i.wip2027Id);
+  if (targets.length === 0) {
+    console.log('No items at Add to NuOrder = Add with a linked WIP2027 item - nothing to check for imagery export.');
+    return;
+  }
+
+  console.log(`Checking imagery export status for ${targets.length} item(s) at Add to NuOrder = Add...`);
+  const exportState = await getWip2027ImageExportState(targets.map((t) => t.wip2027Id));
+
+  for (const target of targets) {
+    const state = exportState[target.wip2027Id];
+    if (!state) {
+      console.warn(`  No WIP2027 data found for linked item ${target.wip2027Id} (Wholesale WIP item ${target.name}) - skipping.`);
+      continue;
+    }
+    if (state.imagesExported) {
+      continue; // Already exported, and "New Pic!" hasn't been pressed to reset it since.
+    }
+    if (!target.masterSku) {
+      console.warn(`  Skipping imagery export for ${target.name} - no Master SKU value found.`);
+      continue;
+    }
+    if (state.files.length === 0) {
+      console.warn(`  Skipping imagery export for ${target.name} - no images found on linked WIP2027 item.`);
+      continue;
+    }
+
+    try {
+      await exportImagesToDropbox(target, state.files);
+      await markImagesExported(target.wip2027Id);
+      console.log(
+        `  Exported ${state.files.length} image(s) for ${target.name} (Master SKU ${target.masterSku}) to Dropbox and marked as exported.`,
+      );
+    } catch (err) {
+      console.error(`  Failed to export imagery for ${target.name}: ${err.message}`);
+      await sendSlackAlert(
+        `Failed to export NuOrder imagery for "${target.name}" (Master SKU ${target.masterSku || '(none)'}): ${err.message}`,
+      );
+    }
+  }
+}
+
 async function main() {
   if (!isManualRun && !isEightPmMountain()) {
     // This cron fires twice a day (once for MST, once for MDT) so it always lands on 8pm
@@ -372,10 +639,16 @@ async function main() {
 
   console.log('Fetching Wholesale WIP items...');
   const wipItems = await getWholesaleWipItems();
+
+  // --- Feature 3 (independent of the Dropped trigger below) ---
+  await processNuOrderImageExports(wipItems);
+
   const candidates = wipItems.filter((i) => !i.reworkAlertSent && i.wip2027Id);
 
   if (candidates.length === 0) {
-    console.log('Nothing to check - no unprocessed items with a linked WIP2027 item.');
+    console.log('Nothing to check for drops - no unprocessed items with a linked WIP2027 item.');
+    saveState(state);
+    console.log('Done.');
     return;
   }
 
@@ -388,12 +661,22 @@ async function main() {
   // order - so if two styles drop in the same run and both hit the same order, that order gets
   // one combined comment instead of two separate ones (per Shelly's call on 2026-08-07).
   const orderMatches = new Map();
+  const lineQueueCache = new Map(); // so_internal_id -> Map(item_id -> [line, ...]), see Feature 2
 
   for (const item of droppedItems) {
     console.log(`Processing dropped style: ${item.name} (Master SKU ${item.masterSku || '(none)'})`);
 
+    // --- Feature 1: unconditional side effect, fires before everything else below ---
+    try {
+      await setAddToNuOrderToRemove(item.id);
+      console.log(`  Set "Add to NuOrder" to Remove on ${item.name}.`);
+    } catch (err) {
+      console.error(`  Failed to set "Add to NuOrder" to Remove on ${item.name}: ${err.message}`);
+      await sendSlackAlert(`Failed to set "Add to NuOrder" to Remove on "${item.name}": ${err.message}`);
+    }
+
     if (!item.masterSku) {
-      console.warn('  Skipping - no Master SKU value found.');
+      console.warn('  Skipping order matching - no Master SKU value found.');
       continue;
     }
 
@@ -402,9 +685,13 @@ async function main() {
       rows = await findMatchingOrderLines(item.masterSku);
     } catch (err) {
       console.error(`  NetSuite query failed: ${err.message}`);
+      await sendSlackAlert(`NetSuite order-matching query failed for "${item.name}" (Master SKU ${item.masterSku}): ${err.message}`);
       continue;
     }
     console.log(`  ${rows.length} matching not-fulfilled order line(s) found.`);
+
+    // --- Feature 2 accumulator: one CSV per dropped style, across every matched order ---
+    const csvRows = [];
 
     for (const row of rows) {
       if (!orderMatches.has(row.order_number)) {
@@ -422,6 +709,28 @@ async function main() {
         agg.skuMap.set(row.master_sku, { shopifyTitle: details.shopifyTitle });
       }
       agg.variantRows.push({ size: details.size, qtyOrdered: row.qty_ordered, position: details.position });
+
+      const lineDetails = await resolveOrderLineDetails(row.so_internal_id, row.item_id, lineQueueCache);
+      if (lineDetails) {
+        csvRows.push({
+          internalId: row.so_internal_id,
+          closed: lineDetails.isClosed,
+          lineId: lineDetails.lineUniqueKey,
+        });
+      } else {
+        console.warn(
+          `  Could not match a NetSuite order line for item ${row.item_id} on order ${row.order_number} - omitting from close-items CSV.`,
+        );
+      }
+    }
+
+    if (csvRows.length > 0) {
+      try {
+        await createSalesOpsCsvPulse(item.masterSku, csvRows);
+      } catch (err) {
+        console.error(`  Failed to create Sales Ops L10 close-items pulse for ${item.masterSku}: ${err.message}`);
+        await sendSlackAlert(`Failed to create Sales Ops L10 close-items pulse for Master SKU ${item.masterSku}: ${err.message}`);
+      }
     }
 
     try {
@@ -429,6 +738,7 @@ async function main() {
       console.log(`  Marked "Rework Alert Sent" on ${item.name}.`);
     } catch (err) {
       console.error(`  Failed to check "Rework Alert Sent" on ${item.name}: ${err.message}`);
+      await sendSlackAlert(`Failed to check "Rework Alert Sent" on "${item.name}": ${err.message}`);
     }
   }
 
@@ -462,6 +772,7 @@ async function main() {
       saveState(state);
     } catch (err) {
       console.error(`  Failed to process order ${orderNumber}: ${err.message}`);
+      await sendSlackAlert(`Failed to process order ${orderNumber}: ${err.message}`);
     }
   }
 
@@ -469,7 +780,10 @@ async function main() {
   console.log('Done.');
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error('Fatal error:', err);
+  await sendSlackAlert(`Fatal error - the run aborted before finishing:\n\`\`\`${err.stack || err.message}\`\`\``, {
+    fatal: true,
+  });
   process.exit(1);
 });

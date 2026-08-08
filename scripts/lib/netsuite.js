@@ -127,3 +127,22 @@ export async function getRecord(recordType, id, fields) {
     query: { fields: fields.join(',') },
   });
 }
+
+// Fetches a sales order's item sublist for the Sales Ops L10 "close items" CSV feature.
+// `isClosed` and a globally-unique per-line key both error out via bulk SuiteQL in this account
+// (see run.js/docs/spec.md for the "closed"/"line" SuiteQL quirks), but come through fine on the
+// record's expanded item sublist. Confirmed live against a real order (MSO-4061, 2026-08-08):
+// GET /record/v1/salesorder/{id}?expandSubResources=true returns `item.items[]`, each with
+// `item.id` (the item's internal id), `line` (the simple 1/2/3 sequence), `lineUniqueKey` (the
+// globally-unique key Shelly confirmed is what "Line ID" means for this CSV), and `isClosed`.
+export async function getSalesOrderLines(soInternalId) {
+  const data = await netsuiteFetch('GET', `/services/rest/record/v1/salesorder/${soInternalId}`, {
+    query: { expandSubResources: true },
+  });
+  return (data.item?.items || []).map((line) => ({
+    itemId: line.item?.id,
+    line: line.line,
+    lineUniqueKey: line.lineUniqueKey,
+    isClosed: line.isClosed === true,
+  }));
+}
