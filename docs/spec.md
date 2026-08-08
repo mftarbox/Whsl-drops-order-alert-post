@@ -22,6 +22,7 @@ When a style's Planning Indicator moves to Dropped on Wholesale WIP, find every 
 12. All other pulse columns (Priority, Status, Due Date, Notes, External ID) intentionally left blank for now.
 13. An order that later matches a second dropped SKU gets an update/comment appended to its existing pulse rather than a duplicate pulse, tracked via `state/state.json` (order # → Monday pulse ID), committed back to the repo by the workflow each run.
 14. No additional notification channel - the Monday pulse itself is sufficient.
+15. Before appending an update to a previously-created pulse (via `state/state.json`), the script now checks that pulse's current `state` on monday (`active`, `archived`, `deleted`, or not found at all for a fully-deleted item). Only `active` pulses get the append. If the pulse was archived, trashed/deleted, or no longer exists, the script creates a brand-new pulse instead and overwrites the order's entry in `state/state.json` to point to the new pulse ID (added 2026-08-08, per Shelly's direction after the Monday OAuth app rebuild).
 
 ## Parked: richer pulse comment (not currently in code)
 

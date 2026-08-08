@@ -206,23 +206,48 @@ async function getMondayUserByEmail(email) {
   return data.users?.[0] || null;
 }
 
+// monday's `state` field on an item is "active", "archived", or "deleted". A fully deleted item
+// simply won't come back in the items() query at all, so an empty result means "gone" too.
+async function getPulseState(pulseId) {
+  const data = await mondayGraphQL(
+    `
+    query ($itemId: ID!) {
+      items(ids: [$itemId]) {
+        id
+        state
+      }
+    }
+    `,
+    { itemId: pulseId },
+  );
+  return data.items?.[0]?.state || null;
+}
+
 async function createOrUpdatePulse({ orderNumber, customerName, personMondayId }, state) {
   const existing = state[orderNumber];
 
   if (existing?.pulseId) {
-    await mondayGraphQL(
-      `
-      mutation ($itemId: ID!, $body: String!) {
-        create_update(item_id: $itemId, body: $body) { id }
-      }
-      `,
-      {
-        itemId: existing.pulseId,
-        body: `Another dropped style now affects this order (flagged ${new Date().toISOString().slice(0, 10)}).`,
-      },
+    const pulseState = await getPulseState(existing.pulseId);
+    if (pulseState === 'active') {
+      await mondayGraphQL(
+        `
+        mutation ($itemId: ID!, $body: String!) {
+          create_update(item_id: $itemId, body: $body) { id }
+        }
+        `,
+        {
+          itemId: existing.pulseId,
+          body: `Another dropped style now affects this order (flagged ${new Date().toISOString().slice(0, 10)}).`,
+        },
+      );
+      console.log(`  Appended update to existing pulse ${existing.pulseId} for order ${orderNumber}.`);
+      return existing.pulseId;
+    }
+    console.log(
+      `  Existing pulse ${existing.pulseId} for order ${orderNumber} is no longer active (state: ${
+        pulseState || 'not found'
+      }) - creating a new pulse instead.`,
     );
-    console.log(`  Appended update to existing pulse ${existing.pulseId} for order ${orderNumber}.`);
-    return existing.pulseId;
   }
 
   const itemName = `${orderNumber} has drops - ${customerName}`;
