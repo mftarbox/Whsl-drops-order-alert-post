@@ -554,6 +554,29 @@ async function markImagesExported(wip2027Id) {
   );
 }
 
+// Fires after every export *attempt* for an item - on success AND on failure (Shelly's call,
+// 2026-08-08) - flipping Wholesale WIP's "Add to NuOrder" to "Update NetSuite", which drives
+// the same Celigo sync used elsewhere on this column (per the column's own description in
+// Monday: "Drives the Celigo sync that checks/unchecks the NuOrder Active / NuORDER Sync boxes
+// on the matching NetSuite item(s)"). Once flipped, the item naturally drops out of
+// processNuOrderImageExports's `targets` filter (which requires addToNuOrder === 'Add'), so this
+// doesn't re-fire on every subsequent run.
+async function setAddToNuOrderToUpdateNetSuite(itemId) {
+  await mondayGraphQL(
+    `
+    mutation ($boardId: ID!, $itemId: ID!, $columnId: String!, $value: JSON!) {
+      change_column_value(board_id: $boardId, item_id: $itemId, column_id: $columnId, value: $value) { id }
+    }
+    `,
+    {
+      boardId: WHOLESALE_WIP_BOARD,
+      itemId,
+      columnId: COL_ADD_TO_NUORDER,
+      value: JSON.stringify({ label: 'Update NetSuite' }),
+    },
+  );
+}
+
 // Exports every image in WIP2027's Image column, renamed to "{Master SKU}-0{sequence}.{ext}"
 // (e.g. "10176-3232-01.png", confirmed with Shelly against real filenames on 2026-08-07 - the
 // convention is a literal "0" + a single-digit sequence, since up to 5 images is the practical
@@ -623,6 +646,17 @@ async function processNuOrderImageExports(wipItems) {
       await sendSlackAlert(
         `Failed to export NuOrder imagery for "${target.name}" (Master SKU ${target.masterSku || '(none)'}): ${err.message}`,
       );
+    } finally {
+      // Fires regardless of whether the export above succeeded or failed - see
+      // setAddToNuOrderToUpdateNetSuite for why, and note this is wrapped independently so a
+      // failure here gets its own alert rather than masking (or being masked by) the export result.
+      try {
+        await setAddToNuOrderToUpdateNetSuite(target.id);
+        console.log(`  Set "Add to NuOrder" to "Update NetSuite" on ${target.name}.`);
+      } catch (err) {
+        console.error(`  Failed to set "Add to NuOrder" to "Update NetSuite" on ${target.name}: ${err.message}`);
+        await sendSlackAlert(`Failed to set "Add to NuOrder" to "Update NetSuite" on "${target.name}": ${err.message}`);
+      }
     }
   }
 }
