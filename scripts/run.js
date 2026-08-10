@@ -49,7 +49,8 @@ const SALES_OPS_GROUP = 'new_group72329__1'; // "ToDo"
 const SALES_OPS_PRIORITY_COLUMN = 'status_1_mkm2z4qr';
 const SALES_OPS_PRIORITY_HIGH_LABEL = 'High Priority';
 const NETSUITE_CLOSE_ITEMS_IMPORT_URL =
-  'https://4775967.app.netsuite.com/app/setup/assistants/nsimport/importassistant.nl?recid=235&new=T';
+  'https://4775967.app.netsuite.com/app/setup/assistants/nsimport/importassistant.nl?recid=311&new=T';
+const NETSUITE_CLOSE_ITEMS_IMPORT_LABEL = 'Whsl Close Sales Order Items';
 
 // Confirmed live on 2026-08-08 by resolving Shelly's original share link's folder name against
 // a full account-wide Dropbox search - there's a second, unrelated "NuOrder Imagery" folder
@@ -417,12 +418,13 @@ async function markReworkAlertSent(itemId) {
 
 // --- Feature 2: Sales Ops L10 "close items" CSV pulse ------------------------------------
 // Reuses the exact same NetSuite rows already fetched for the Wholesale L10 rep pulses (see
-// main()) - no separate matching query. Per matched order line we additionally need "Closed"
-// and "Line ID" (= Line Unique Key), which come from a NetSuite record-level fetch of that
-// order's item sublist (see lib/netsuite.js getSalesOrderLines) rather than another SuiteQL
-// call, since both fields error out via bulk SuiteQL in this account. Cached per order for the
-// life of a run, and each line is only ever handed out once (queued by item id) so two rows
-// referencing the exact same item on an order can't both grab the same underlying line.
+// main()) - no separate matching query. Per matched order line we additionally need "Line ID"
+// (= the simple `line` sequence number, NOT lineUniqueKey - see 2026-08-10 note in
+// lib/netsuite.js getSalesOrderLines for why), which comes from a NetSuite record-level fetch of
+// that order's item sublist (see getSalesOrderLines) rather than another SuiteQL call, since
+// that field errors out via bulk SuiteQL in this account. Cached per order for the life of a
+// run, and each line is only ever handed out once (queued by item id) so two rows referencing
+// the exact same item on an order can't both grab the same underlying line.
 async function resolveOrderLineDetails(soInternalId, itemId, lineQueueCache) {
   if (!lineQueueCache.has(soInternalId)) {
     let lines = [];
@@ -449,9 +451,16 @@ async function resolveOrderLineDetails(soInternalId, itemId, lineQueueCache) {
   return queue.shift();
 }
 
+// Closed is always written as literal TRUE (Shelly: every line on this CSV is one being closed,
+// regardless of its current isClosed value in NetSuite). Line ID is the line's simple `line`
+// sequence number (2026-08-10: confirmed via Shelly's manual test against recid=311 - NetSuite's
+// classic CSV Import Assistant has no way to map to lineUniqueKey at all, so `line` is what the
+// saved import actually expects; only reliable if nobody resaves/reorders the order's lines
+// between CSV generation and import). Amount/Item columns were tried and then dropped again
+// (2026-08-10, Shelly's request) - back to just these 3 columns.
 function buildCloseItemsCsv(rows) {
   const header = 'Internal ID,Closed,Line ID';
-  const lines = rows.map((r) => `${r.internalId},${r.closed},${r.lineId}`);
+  const lines = rows.map((r) => `${r.internalId},TRUE,${r.lineId}`);
   return [header, ...lines].join('\n') + '\n';
 }
 
@@ -481,7 +490,7 @@ async function createSalesOpsCsvPulse(masterSku, csvRows) {
   const commentBody = [
     `<b>${masterSku}</b> dropped - the attached CSV lists every affected sales order line to close in NetSuite.`,
     '',
-    `Close Sales Order Items CSV Import mapping: <a href="${NETSUITE_CLOSE_ITEMS_IMPORT_URL}">${NETSUITE_CLOSE_ITEMS_IMPORT_URL}</a>`,
+    `Close Sales Order Items CSV Import mapping: <a href="${NETSUITE_CLOSE_ITEMS_IMPORT_URL}">${NETSUITE_CLOSE_ITEMS_IMPORT_LABEL}</a>`,
   ].join('<br>');
   const updateId = await postComment(pulseId, commentBody);
 
@@ -748,8 +757,7 @@ async function main() {
       if (lineDetails) {
         csvRows.push({
           internalId: row.so_internal_id,
-          closed: lineDetails.isClosed,
-          lineId: lineDetails.lineUniqueKey,
+          lineId: lineDetails.line,
         });
       } else {
         console.warn(

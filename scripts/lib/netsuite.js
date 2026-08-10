@@ -129,12 +129,21 @@ export async function getRecord(recordType, id, fields) {
 }
 
 // Fetches a sales order's item sublist for the Sales Ops L10 "close items" CSV feature.
-// `isClosed` and a globally-unique per-line key both error out via bulk SuiteQL in this account
-// (see run.js/docs/spec.md for the "closed"/"line" SuiteQL quirks), but come through fine on the
+// `isClosed` and per-line detail both error out via bulk SuiteQL in this account (see
+// run.js/docs/spec.md for the "closed"/"line" SuiteQL quirks), but come through fine on the
 // record's expanded item sublist. Confirmed live against a real order (MSO-4061, 2026-08-08):
 // GET /record/v1/salesorder/{id}?expandSubResources=true returns `item.items[]`, each with
-// `item.id` (the item's internal id), `line` (the simple 1/2/3 sequence), `lineUniqueKey` (the
-// globally-unique key Shelly confirmed is what "Line ID" means for this CSV), and `isClosed`.
+// `item.id` (the item's internal id), `line` (the simple 1/2/3 sequence - USE THIS for the
+// CSV's "Line ID" column), `lineUniqueKey` (a globally-unique, position-independent key - NOT
+// usable here; NetSuite's classic CSV Import Assistant has no field-mapping option for it at
+// all, confirmed 2026-08-10 against the saved "Whsl Close Sales Order Items" import, recid=311 -
+// only `line` is offered for "Line ID", and Shelly confirmed via a real manual test that mapping
+// works when given the correct current `line` value. This means Line ID is only reliable if
+// nobody resaves/reorders the order's lines between when this CSV is generated and when it's
+// imported - `lineUniqueKey` would have been immune to that but isn't reachable through this
+// import mechanism), and `isClosed`. `amount`/`itemRefName` are also returned (harmless, cheap
+// off this same fetch) but as of 2026-08-10 are unused - the CSV briefly had Amount/Item columns
+// and Shelly asked to drop them again, back to just Internal ID/Closed/Line ID.
 export async function getSalesOrderLines(soInternalId) {
   const data = await netsuiteFetch('GET', `/services/rest/record/v1/salesorder/${soInternalId}`, {
     query: { expandSubResources: true },
@@ -144,5 +153,7 @@ export async function getSalesOrderLines(soInternalId) {
     line: line.line,
     lineUniqueKey: line.lineUniqueKey,
     isClosed: line.isClosed === true,
+    amount: line.amount,
+    itemRefName: line.item?.refName,
   }));
 }
