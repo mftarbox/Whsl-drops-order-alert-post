@@ -7,6 +7,8 @@
 //   3. Independent trigger: Wholesale WIP items at "Add to NuOrder" = "Add" get their WIP2027
 //      images exported to the NuOrder Imagery Dropbox folder.
 //   4. Slack alerts to #whsl_ops_workflow_alerts on both fatal and per-item/per-order errors.
+//   5. End of every real run: triggers Celigo's native "Monday to NetSuite" sync flow on-demand
+//      (see finishRun()), replacing that flow's separate Celigo-side schedule.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -15,6 +17,7 @@ import { mondayGraphQL, getAssets, mondayUploadFile } from './lib/monday.js';
 import { runSuiteQL, getRecord, getSalesOrderLines } from './lib/netsuite.js';
 import { uploadFile as uploadToDropbox } from './lib/dropbox.js';
 import { sendSlackAlert } from './lib/slack.js';
+import { runCeligoFlow } from './lib/celigo.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_PATH = path.join(__dirname, '..', 'state', 'state.json');
@@ -57,6 +60,13 @@ const NETSUITE_CLOSE_ITEMS_IMPORT_LABEL = 'Whsl Close Sales Order Items';
 // nested under /Apps/nuorder-imagery-netsuite-sync from an earlier integration attempt; this is
 // deliberately NOT that one.
 const DROPBOX_IMAGERY_FOLDER = '/NuOrder Imagery';
+
+// Celigo's native "Monday to NetSuite" sync flow - grabbed from the flow's URL in integrator.io
+// (https://integrator.io/integrations/66f5896552a1b5dd437da348/flowBuilder/<this id>), 2026-08-10.
+// This fully replaces that flow's separate Celigo-side schedule (Shelly's call) - see main()'s
+// finishRun() for where/why this fires (once per run, after every "Add to NuOrder" change for
+// that run has already happened - see docs/spec.md for the timing discussion).
+const CELIGO_MONDAY_TO_NETSUITE_FLOW_ID = '6a7520cb8d2dd2212253f91d';
 
 const isManualRun = process.env.GITHUB_EVENT_NAME === 'workflow_dispatch';
 
@@ -670,6 +680,25 @@ async function processNuOrderImageExports(wipItems) {
   }
 }
 
+// Point C, per docs/spec.md's timing discussion: called once at the very end of every real run
+// (not the twice-daily cron tick that skips entirely because it's not 8pm Mountain) - after every
+// "Add to NuOrder" change that run (both Feature 1's Remove flip and Feature 3's Update NetSuite
+// flip) has already happened. Fires unconditionally, even on the early-exit path where there
+// were no drop candidates to check, since Feature 3's flips happen before that check either way.
+// Never throws - a Celigo failure here shouldn't affect the run's exit code, same convention as
+// every other non-fatal error path in this script (log + Slack alert only, per Shelly's call).
+async function finishRun(state) {
+  saveState(state);
+  try {
+    await runCeligoFlow(CELIGO_MONDAY_TO_NETSUITE_FLOW_ID);
+    console.log('Triggered Celigo Monday-to-NetSuite sync flow.');
+  } catch (err) {
+    console.error(`Failed to trigger Celigo Monday-to-NetSuite sync flow: ${err.message}`);
+    await sendSlackAlert(`Failed to trigger Celigo Monday-to-NetSuite sync flow: ${err.message}`);
+  }
+  console.log('Done.');
+}
+
 async function main() {
   if (!isManualRun && !isEightPmMountain()) {
     // This cron fires twice a day (once for MST, once for MDT) so it always lands on 8pm
@@ -690,8 +719,7 @@ async function main() {
 
   if (candidates.length === 0) {
     console.log('Nothing to check for drops - no unprocessed items with a linked WIP2027 item.');
-    saveState(state);
-    console.log('Done.');
+    await finishRun(state);
     return;
   }
 
@@ -818,8 +846,7 @@ async function main() {
     }
   }
 
-  saveState(state);
-  console.log('Done.');
+  await finishRun(state);
 }
 
 main().catch(async (err) => {
