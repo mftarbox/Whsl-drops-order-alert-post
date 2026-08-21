@@ -1,4 +1,4 @@
-﻿name: Wholesale Drops Order Alert
+name: Wholesale Drops Order Alert
 
 on:
   schedule:
@@ -36,6 +36,7 @@ jobs:
           DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
           DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
           SLACK_ALERTS_WEBHOOK_URL: ${{ secrets.SLACK_ALERTS_WEBHOOK_URL }}
+          CELIGO_API_TOKEN: ${{ secrets.CELIGO_API_TOKEN }}
         run: node scripts/run.js
 
       - name: Commit updated state file
