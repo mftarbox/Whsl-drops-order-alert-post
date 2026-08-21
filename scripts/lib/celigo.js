@@ -14,9 +14,15 @@
 // the token with only name/description/expiration set and no scope fields touched at all -
 // permissions are inherited automatically from whatever the account share already grants.
 
-const API_TOKEN = requireEnv('CELIGO_API_TOKEN');
 const API_BASE = process.env.CELIGO_API_BASE || 'https://api.integrator.io';
 
+// Deliberately checked lazily, inside the function, NOT at module load time. This module is
+// imported unconditionally at the top of run.js - if the token check ran at import time (like
+// lib/monday.js and lib/dropbox.js do, since those ARE hard requirements for the whole script),
+// a missing/misconfigured CELIGO_API_TOKEN would crash the entire run before any of the other,
+// already-working features even got a chance to execute. Since finishRun() already wraps this
+// call in its own try/catch (log + Slack alert only, per Shelly's call), the failure needs to
+// surface there, not at import time.
 function requireEnv(name) {
   const value = process.env[name];
   if (!value) {
@@ -26,9 +32,10 @@ function requireEnv(name) {
 }
 
 export async function runCeligoFlow(flowId) {
+  const apiToken = requireEnv('CELIGO_API_TOKEN');
   const res = await fetch(`${API_BASE}/v1/flows/${flowId}/run`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${API_TOKEN}` },
+    headers: { Authorization: `Bearer ${apiToken}` },
   });
 
   const text = await res.text();
