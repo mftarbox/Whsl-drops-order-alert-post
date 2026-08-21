@@ -103,7 +103,7 @@ function isChecked(checkboxColumnValue) {
 }
 
 // Splits an array into chunks of at most `size` - used to stay under Monday's hard 100-item cap
-// on both items_page pages and the root-level items(ids:) query (see 2026-08-21 bug below).
+// on both items_page pages and the root-level items(ids:) query (see 2026-08-21 bugs below).
 function chunk(array, size) {
   const chunks = [];
   for (let i = 0; i < array.length; i += size) {
@@ -191,6 +191,18 @@ async function getWholesaleWipItems() {
 // (unsupported/undefined behavior above that). candidates.length can now exceed 100 on a 338-item
 // board, so a single un-batched call here would silently drop or error past the first 100 (the
 // same class of bug fixed in getWholesaleWipItems() above, 2026-08-21).
+//
+// SECOND, MORE SEVERE bug found the same day (2026-08-21), after the above chunking fix still
+// didn't catch a confirmed-live "Dropped" item (SHN-3191, Master SKU 10471-3191): this query's
+// `items(ids: $itemIds)` had no `limit` argument. Monday's API defaults that query's page size to
+// 25 when `limit` is omitted - it does NOT return "all IDs you asked for, up to 100" like the
+// name implies. So every 100-ID batch was silently truncated to only its first 25 items (ordered
+// by Monday's own internal item-id ordering, unrelated to anything meaningful here), and the
+// other ~75 items in each batch were never even looked at - `indicators[wip2027Id]` was just
+// `undefined` for them, which fails the `=== 'Dropped'` check with no error or log line. Confirmed
+// directly: re-running the exact batch that contained SHN-3191's WIP2027 item with `limit: 100`
+// added returned all 100 items (including it, correctly showing "Dropped"); without `limit` it
+// returned only 25. Fixed by explicitly passing `limit: 100` (matches the batch size from chunk()).
 async function getPlanningIndicators(itemIds) {
   if (itemIds.length === 0) return {};
   const map = {};
@@ -198,7 +210,7 @@ async function getPlanningIndicators(itemIds) {
     const data = await mondayGraphQL(
       `
       query ($itemIds: [ID!]) {
-        items(ids: $itemIds) {
+        items(ids: $itemIds, limit: 100) {
           id
           column_values(ids: ["${COL_PLANNING_INDICATOR}"]) {
             text
@@ -572,7 +584,8 @@ async function createSalesOpsCsvPulse(masterSku, csvRows) {
 // Mountain cadence), gated purely on Wholesale WIP's real "Add to NuOrder" status column and
 // WIP2027's own "NuOrder Images Exported" checkbox (idempotency + re-trigger, see docs/spec.md).
 // Batched in chunks of 100 - same reason as getPlanningIndicators() above (Monday's items(ids:)
-// 100-ID cap, 2026-08-21).
+// 100-ID cap, PLUS its default limit:25 truncation when `limit` isn't explicitly passed - see the
+// detailed 2026-08-21 note on getPlanningIndicators() above for how that second bug was found).
 async function getWip2027ImageExportState(itemIds) {
   if (itemIds.length === 0) return {};
   const map = {};
@@ -580,7 +593,7 @@ async function getWip2027ImageExportState(itemIds) {
     const data = await mondayGraphQL(
       `
       query ($itemIds: [ID!]) {
-        items(ids: $itemIds) {
+        items(ids: $itemIds, limit: 100) {
           id
           column_values(ids: ["${COL_WIP2027_IMAGES_EXPORTED}", "${COL_WIP2027_IMAGE}"]) {
             id

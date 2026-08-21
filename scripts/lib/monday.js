@@ -32,6 +32,14 @@ export async function mondayGraphQL(query, variables = {}) {
 // Resolves file column asset IDs (parsed from a files-type column's raw `value` JSON) to
 // downloadable metadata. `public_url` is a presigned S3 link valid for ~1 hour - fine since
 // this is only ever used to immediately download and re-upload to Dropbox in the same run.
+//
+// Audited 2026-08-21 alongside the items(ids:) default-limit bug found elsewhere (see
+// getPlanningIndicators() in run.js): confirmed via Monday's own schema introspection that
+// `assets(ids:)`, unlike `items(ids:)`/`users(...)`, has NO `limit` argument at all - so there's
+// no missing-limit bug to fix here (and no way to add one - `assets(ids: $ids, limit: 100)` is a
+// GraphQL schema error, not a fix). This is only ever called with one Wholesale WIP item's own
+// image files at a time (exportImagesToDropbox notes up to ~5 images is the practical max per
+// item), so even if `assets` has its own undocumented default page size, it isn't reachable here.
 export async function getAssets(assetIds) {
   if (!assetIds.length) return [];
   const data = await mondayGraphQL(
