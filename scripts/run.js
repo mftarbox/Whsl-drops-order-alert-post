@@ -26,7 +26,7 @@ const STATE_PATH = path.join(__dirname, '..', 'state', 'state.json');
 const WHOLESALE_WIP_BOARD = 18419234689;
 const WIP2027_BOARD = 18388071004;
 const L10_BOARD = 3552781534;
-const L10_GROUP = 'new_group_mkn8x1ye'; // "Wholesale Order Board"
+const L10_GROUP = 'group_mm1mrkqe'; // "Customer Drops Communication Needed"
 const L10_PERSON_COLUMN = 'person';
 
 const COL_BOARD_RELATION = 'board_relation_mm5z9qmh'; // Wholesale WIP -> WIP2027 Source Item link
@@ -102,35 +102,79 @@ function isChecked(checkboxColumnValue) {
   return checkboxColumnValue.text === 'v';
 }
 
+// Splits an array into chunks of at most `size` - used to stay under Monday's hard 100-item cap
+// on both items_page pages and the root-level items(ids:) query (see 2026-08-21 bug below).
+function chunk(array, size) {
+  const chunks = [];
+  for (let i = 0; i < array.length; i += size) {
+    chunks.push(array.slice(i, i + size));
+  }
+  return chunks;
+}
+
+// Bug found 2026-08-21: this originally fetched a single un-paginated items_page(limit: 100),
+// silently missing every item beyond the first 100 Monday happened to return - on a 338-item
+// board (as of 2026-08-20's bulk item creation), up to 238 items were invisible to this script
+// every run, regardless of their actual drop status. A real "Dropped" style (SHN-3191, Master
+// SKU 10471-3191) was missed this way. Fixed to page through the full board via items_page's
+// cursor until exhausted.
 async function getWholesaleWipItems() {
-  const data = await mondayGraphQL(
-    `
-    query ($boardId: ID!, $columnIds: [String!]) {
-      boards(ids: [$boardId]) {
-        items_page(limit: 100) {
-          items {
-            id
-            name
-            column_values(ids: $columnIds) {
-              id
-              text
-              value
-              ... on BoardRelationValue { linked_item_ids }
-              ... on FormulaValue { display_value }
-              ... on CheckboxValue { checked }
+  const columnIds = [COL_BOARD_RELATION, COL_MASTER_SKU, COL_REWORK_CHECKBOX, COL_ADD_TO_NUORDER];
+  const rawItems = [];
+  let cursor = null;
+
+  do {
+    const data = await mondayGraphQL(
+      cursor
+        ? `
+          query ($cursor: String!, $columnIds: [String!]) {
+            next_items_page(limit: 100, cursor: $cursor) {
+              cursor
+              items {
+                id
+                name
+                column_values(ids: $columnIds) {
+                  id
+                  text
+                  value
+                  ... on BoardRelationValue { linked_item_ids }
+                  ... on FormulaValue { display_value }
+                  ... on CheckboxValue { checked }
+                }
+              }
             }
           }
-        }
-      }
-    }
-    `,
-    {
-      boardId: WHOLESALE_WIP_BOARD,
-      columnIds: [COL_BOARD_RELATION, COL_MASTER_SKU, COL_REWORK_CHECKBOX, COL_ADD_TO_NUORDER],
-    },
-  );
+          `
+        : `
+          query ($boardId: ID!, $columnIds: [String!]) {
+            boards(ids: [$boardId]) {
+              items_page(limit: 100) {
+                cursor
+                items {
+                  id
+                  name
+                  column_values(ids: $columnIds) {
+                    id
+                    text
+                    value
+                    ... on BoardRelationValue { linked_item_ids }
+                    ... on FormulaValue { display_value }
+                    ... on CheckboxValue { checked }
+                  }
+                }
+              }
+            }
+          }
+          `,
+      cursor ? { cursor, columnIds } : { boardId: WHOLESALE_WIP_BOARD, columnIds },
+    );
 
-  return data.boards[0].items_page.items.map((item) => {
+    const page = cursor ? data.next_items_page : data.boards[0].items_page;
+    rawItems.push(...page.items);
+    cursor = page.cursor;
+  } while (cursor);
+
+  return rawItems.map((item) => {
     const cv = Object.fromEntries(item.column_values.map((c) => [c.id, c]));
     return {
       id: item.id,
@@ -143,24 +187,30 @@ async function getWholesaleWipItems() {
   });
 }
 
+// Batched in chunks of 100 - Monday's root-level items(ids:) query hard-caps at 100 IDs per call
+// (unsupported/undefined behavior above that). candidates.length can now exceed 100 on a 338-item
+// board, so a single un-batched call here would silently drop or error past the first 100 (the
+// same class of bug fixed in getWholesaleWipItems() above, 2026-08-21).
 async function getPlanningIndicators(itemIds) {
   if (itemIds.length === 0) return {};
-  const data = await mondayGraphQL(
-    `
-    query ($itemIds: [ID!]) {
-      items(ids: $itemIds) {
-        id
-        column_values(ids: ["${COL_PLANNING_INDICATOR}"]) {
-          text
+  const map = {};
+  for (const batch of chunk(itemIds, 100)) {
+    const data = await mondayGraphQL(
+      `
+      query ($itemIds: [ID!]) {
+        items(ids: $itemIds) {
+          id
+          column_values(ids: ["${COL_PLANNING_INDICATOR}"]) {
+            text
+          }
         }
       }
+      `,
+      { itemIds: batch },
+    );
+    for (const item of data.items) {
+      map[item.id] = item.column_values[0]?.text;
     }
-    `,
-    { itemIds },
-  );
-  const map = {};
-  for (const item of data.items) {
-    map[item.id] = item.column_values[0]?.text;
   }
   return map;
 }
@@ -521,38 +571,42 @@ async function createSalesOpsCsvPulse(masterSku, csvRows) {
 // Independent of the Dropped trigger above - runs every time this script runs (same 8pm
 // Mountain cadence), gated purely on Wholesale WIP's real "Add to NuOrder" status column and
 // WIP2027's own "NuOrder Images Exported" checkbox (idempotency + re-trigger, see docs/spec.md).
+// Batched in chunks of 100 - same reason as getPlanningIndicators() above (Monday's items(ids:)
+// 100-ID cap, 2026-08-21).
 async function getWip2027ImageExportState(itemIds) {
   if (itemIds.length === 0) return {};
-  const data = await mondayGraphQL(
-    `
-    query ($itemIds: [ID!]) {
-      items(ids: $itemIds) {
-        id
-        column_values(ids: ["${COL_WIP2027_IMAGES_EXPORTED}", "${COL_WIP2027_IMAGE}"]) {
+  const map = {};
+  for (const batch of chunk(itemIds, 100)) {
+    const data = await mondayGraphQL(
+      `
+      query ($itemIds: [ID!]) {
+        items(ids: $itemIds) {
           id
-          value
-          ... on CheckboxValue { checked }
+          column_values(ids: ["${COL_WIP2027_IMAGES_EXPORTED}", "${COL_WIP2027_IMAGE}"]) {
+            id
+            value
+            ... on CheckboxValue { checked }
+          }
         }
       }
-    }
-    `,
-    { itemIds },
-  );
+      `,
+      { itemIds: batch },
+    );
 
-  const map = {};
-  for (const item of data.items) {
-    const cv = Object.fromEntries(item.column_values.map((c) => [c.id, c]));
-    let files = [];
-    try {
-      const parsed = cv[COL_WIP2027_IMAGE]?.value ? JSON.parse(cv[COL_WIP2027_IMAGE].value) : null;
-      files = parsed?.files || [];
-    } catch {
-      files = [];
+    for (const item of data.items) {
+      const cv = Object.fromEntries(item.column_values.map((c) => [c.id, c]));
+      let files = [];
+      try {
+        const parsed = cv[COL_WIP2027_IMAGE]?.value ? JSON.parse(cv[COL_WIP2027_IMAGE].value) : null;
+        files = parsed?.files || [];
+      } catch {
+        files = [];
+      }
+      map[item.id] = {
+        imagesExported: isChecked(cv[COL_WIP2027_IMAGES_EXPORTED]),
+        files,
+      };
     }
-    map[item.id] = {
-      imagesExported: isChecked(cv[COL_WIP2027_IMAGES_EXPORTED]),
-      files,
-    };
   }
   return map;
 }
