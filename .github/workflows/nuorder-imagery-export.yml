@@ -1,0 +1,29 @@
+name: NuOrder Imagery Export
+
+on:
+  schedule:
+    # Same twice-daily DST-proofing pattern as Dropped Rework Alert - the script itself checks
+    # the current Mountain hour and no-ops unless it's actually 8pm Mountain.
+    - cron: '0 2 * * *'
+    - cron: '0 3 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  nuorder-imagery-export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run NuOrder Imagery Export
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          MONDAY_API_TOKEN: ${{ secrets.MONDAY_API_TOKEN }}
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+          SLACK_ALERTS_WEBHOOK_URL: ${{ secrets.SLACK_ALERTS_WEBHOOK_URL }}
+        run: node scripts/nuorder-imagery-export.js
