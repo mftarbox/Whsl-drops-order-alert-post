@@ -669,6 +669,17 @@ async function setAddToNuOrderToUpdateNetSuite(itemId) {
 // max). Sequence follows the order files appear in the column (upload order). Binary content,
 // file type, and file size pass through completely untouched - only the filename changes.
 async function exportImagesToDropbox(target, files) {
+  if (files.length === 0) {
+    // Shelly's call, 2026-09-08: a missing image is a real export failure, not a silent skip -
+    // it needs a Slack alert like any other export problem, and "Add to NuOrder" should still
+    // flip to "Update NetSuite" afterward (handled by the caller's `finally` block) so the item
+    // doesn't get stuck at "Add" forever with no downstream signal. Throwing here (rather than
+    // just letting the loop below no-op on an empty array) is what makes that happen - an empty
+    // `files` array would otherwise iterate zero times and return "successfully" with zero
+    // uploads, which would incorrectly mark the item as exported.
+    throw new Error('No images found on linked WIP2027 item');
+  }
+
   const assetIds = files.map((f) => String(f.assetId));
   const assets = await getAssets(assetIds);
   const assetById = Object.fromEntries(assets.map((a) => [a.id, a]));
@@ -716,10 +727,10 @@ async function processNuOrderImageExports(wipItems) {
       console.warn(`  Skipping imagery export for ${target.name} - no Master SKU value found.`);
       continue;
     }
-    if (state.files.length === 0) {
-      console.warn(`  Skipping imagery export for ${target.name} - no images found on linked WIP2027 item.`);
-      continue;
-    }
+    // Note: no "no images found" skip here anymore (removed 2026-09-08, Shelly's call) - an
+    // empty Image column now falls through into the try block below, where
+    // exportImagesToDropbox() explicitly throws so it's treated as a real export failure
+    // (Slack alert + still flips "Add to NuOrder" via the `finally` block), not a silent skip.
 
     try {
       await exportImagesToDropbox(target, state.files);
