@@ -1,0 +1,30 @@
+name: Celigo NetSuite Sync
+
+on:
+  # Chains automatically after either upstream workflow completes - both can change "Add to
+  # NuOrder" (Dropped Rework Alert's "Remove" flip, NuOrder Imagery Export's "Update NetSuite"
+  # flip), so both need Celigo to run afterward. Fires on every completion, success or failure
+  # (Shelly's call - matches the original combined script's "fire regardless" behavior), and on
+  # both the real 8pm tick and the throwaway DST tick - the job-level gate below is what actually
+  # limits real Celigo calls to the real tick.
+  workflow_run:
+    workflows: ["Dropped Rework Alert", "NuOrder Imagery Export"]
+    types: [completed]
+  workflow_dispatch: {}
+
+jobs:
+  celigo-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run Celigo NetSuite Sync
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          CELIGO_API_TOKEN: ${{ secrets.CELIGO_API_TOKEN }}
+          SLACK_ALERTS_WEBHOOK_URL: ${{ secrets.SLACK_ALERTS_WEBHOOK_URL }}
+        run: node scripts/celigo-sync.js
