@@ -8,14 +8,19 @@ const WEBHOOK_URL = process.env.SLACK_ALERTS_WEBHOOK_URL;
 // fatal: true = the whole run is aborting because of this. fatal: false = a single item/order
 // failed and was skipped, but the run is continuing. Shelly asked for alerts on both tiers
 // (2026-08-08).
-export async function sendSlackAlert(message, { fatal = false } = {}) {
+//
+// source: which workflow sent this alert (added 2026-09-08 when the original single-script
+// automation was split into three separate GitHub Actions workflows - see docs/spec.md decision
+// 25). Defaults to the original combined workflow's name so nothing breaks if some caller doesn't
+// pass one, but every current caller does.
+export async function sendSlackAlert(message, { fatal = false, source = 'Wholesale Drops Order Alert' } = {}) {
   if (!WEBHOOK_URL) {
     console.warn('SLACK_ALERTS_WEBHOOK_URL not set - skipping Slack alert. Message was:', message);
     return;
   }
 
   const prefix = fatal ? ':red_circle: *FATAL ERROR*' : ':warning: *Error*';
-  const text = `${prefix} - Wholesale Drops Order Alert workflow\n${message}`;
+  const text = `${prefix} - ${source} workflow\n${message}`;
 
   try {
     const res = await fetch(WEBHOOK_URL, {
