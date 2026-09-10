@@ -108,6 +108,16 @@ async function setAddToNuOrderToRemove(itemId) {
   );
 }
 
+// CHANGED 2026-09-10 (Shelly's request, see docs/spec.md decision 28): matching used to compare
+// ordered quantity against SHIPPED quantity (via PreviousTransactionLineLink fulfillment links),
+// so a line only dropped off the list once it had actually shipped. Shelly asked for this to
+// instead compare ordered quantity against NetSuite's own Allocated quantity
+// (transactionline.quantityallocated, the standard Order Allocation field) - inventory can be
+// reserved/committed to a line well before it ships, so a fully-allocated line no longer needs a
+// rework alert even though nothing's shipped yet. Also excludes lines NetSuite already considers
+// closed (`sol.isclosed = 'F'`) - verified against real data (Master SKU 80070-2419) that a line
+// can show 0 allocated while already closed, which should NOT re-trigger a rework alert; a closed
+// line is one NetSuite itself treats as resolved regardless of what its allocation looks like.
 async function findMatchingOrderLines(masterSku) {
   const sql = `
     SELECT
@@ -118,22 +128,16 @@ async function findMatchingOrderLines(masterSku) {
       item.custitem8 AS master_sku,
       item.itemtype AS item_type,
       ABS(sol.quantity) AS qty_ordered,
-      COALESCE(ABS(shipped.qty_shipped), 0) AS qty_shipped
+      COALESCE(sol.quantityallocated, 0) AS qty_allocated
     FROM transaction so
     JOIN transactionline sol ON sol.transaction = so.id AND sol.mainline = 'F'
     JOIN item ON item.id = sol.item
-    LEFT JOIN (
-      SELECT pl.previousdoc AS so_id, pl.previousline AS so_line, SUM(ifl.quantity) AS qty_shipped
-      FROM PreviousTransactionLineLink pl
-      JOIN transactionline ifl ON ifl.transaction = pl.nextdoc AND ifl.id = pl.nextline
-      WHERE pl.linktype = 'ShipRcpt'
-      GROUP BY pl.previousdoc, pl.previousline
-    ) shipped ON shipped.so_id = sol.transaction AND shipped.so_line = sol.id
     WHERE so.type = 'SalesOrd'
       AND so.cseg_order_class = 7
       AND so.status IN ('B','D','E')
       AND item.custitem8 = '${escapeSql(masterSku)}'
-      AND ABS(sol.quantity) > COALESCE(ABS(shipped.qty_shipped), 0)
+      AND sol.isclosed = 'F'
+      AND ABS(sol.quantity) > COALESCE(sol.quantityallocated, 0)
   `;
   return runSuiteQL(sql);
 }
