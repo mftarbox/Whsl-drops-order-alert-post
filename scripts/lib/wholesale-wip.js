@@ -12,12 +12,16 @@ export const COL_BOARD_RELATION = 'board_relation_mm5z9qmh'; // Wholesale WIP ->
 export const COL_MASTER_SKU = 'formula_mm5z9x2x'; // Wholesale WIP Master SKU (already includes 800-swap)
 export const COL_REWORK_CHECKBOX = 'boolean_mm60zwwz'; // "Rework Alert Sent" on Wholesale WIP
 export const COL_ADD_TO_NUORDER = 'color_mm5zz20q'; // Wholesale WIP "Add to NuOrder" status (Add/Remove/Synced)
-// NOTE: Wholesale WIP also has a Planning Indicator column, but it's a "lookup"/mirror type,
-// which monday.com's API cannot read or filter on at all (confirmed directly against the
-// account). That's why dropped-alert.js reads WIP2027's real status_1__1 column instead, using
-// the board_relation link above to know which WIP2027 items are wholesale-relevant. The same
-// limitation applies to Wholesale WIP's own Image column, which is why nuorder-imagery-export.js
-// reads WIP2027's real files2__1 field instead.
+// CHANGED 2026-09-23 (Shelly's request): dropped-alert.js used to read Planning Indicator from
+// WIP2027's real status_1__1 column via the board_relation link above, because Wholesale WIP's
+// OLD Planning Indicator column was a "lookup"/mirror type, which monday.com's API cannot read or
+// filter on at all. Wholesale WIP has since gotten a new native status column, "WHSL Planning
+// Indicator" (color_mm79m1dk), which the API CAN read directly - so this now fetches it straight
+// off Wholesale WIP like every other column here, and dropped-alert.js no longer needs the
+// WIP2027 link for detection at all. The same lookup/mirror limitation still applies to Wholesale
+// WIP's own Image column, though, which is why nuorder-imagery-export.js still reads WIP2027's
+// real files2__1 field instead.
+export const COL_PLANNING_INDICATOR = 'color_mm79m1dk'; // Wholesale WIP "WHSL Planning Indicator" (native status)
 
 export function isChecked(checkboxColumnValue) {
   if (!checkboxColumnValue) return false;
@@ -44,7 +48,7 @@ export function chunk(array, size) {
 // 10471-3191) was missed this way. Fixed to page through the full board via items_page's cursor
 // until exhausted. See docs/spec.md decision 22 for the full incident writeup.
 export async function getWholesaleWipItems() {
-  const columnIds = [COL_BOARD_RELATION, COL_MASTER_SKU, COL_REWORK_CHECKBOX, COL_ADD_TO_NUORDER];
+  const columnIds = [COL_BOARD_RELATION, COL_MASTER_SKU, COL_REWORK_CHECKBOX, COL_ADD_TO_NUORDER, COL_PLANNING_INDICATOR];
   const rawItems = [];
   let cursor = null;
 
@@ -108,6 +112,7 @@ export async function getWholesaleWipItems() {
       masterSku: cv[COL_MASTER_SKU]?.display_value || cv[COL_MASTER_SKU]?.text,
       reworkAlertSent: isChecked(cv[COL_REWORK_CHECKBOX]),
       addToNuOrder: cv[COL_ADD_TO_NUORDER]?.text || null,
+      planningIndicator: cv[COL_PLANNING_INDICATOR]?.text || null,
     };
   });
 }

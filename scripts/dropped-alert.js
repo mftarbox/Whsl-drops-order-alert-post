@@ -20,21 +20,16 @@ import { mondayGraphQL, mondayUploadFile } from './lib/monday.js';
 import { runSuiteQL, getRecord, getSalesOrderLines } from './lib/netsuite.js';
 import { sendSlackAlert } from './lib/slack.js';
 import { isManualRun, isEightPmMountain } from './lib/schedule.js';
-import { getWholesaleWipItems, chunk, WHOLESALE_WIP_BOARD, COL_ADD_TO_NUORDER, COL_REWORK_CHECKBOX } from './lib/wholesale-wip.js';
+import { getWholesaleWipItems, WHOLESALE_WIP_BOARD, COL_ADD_TO_NUORDER, COL_REWORK_CHECKBOX } from './lib/wholesale-wip.js';
 
 const SOURCE = 'Dropped Rework Alert';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_PATH = path.join(__dirname, '..', 'state', 'state.json');
 
-const WIP2027_BOARD = 18388071004;
 const L10_BOARD = 3552781534;
 const L10_GROUP = 'group_mm1mrkqe'; // "Customer Drops Communication Needed"
 const L10_PERSON_COLUMN = 'person';
-
-const COL_PLANNING_INDICATOR = 'status_1__1'; // Planning Indicator, read from WIP2027 directly
-// NOTE: see lib/wholesale-wip.js for why this is read from WIP2027 rather than Wholesale WIP's
-// own (unreadable, mirror-type) Planning Indicator column.
 
 const SALES_OPS_BOARD = 7017226460;
 const SALES_OPS_GROUP = 'new_group72329__1'; // "ToDo"
@@ -58,33 +53,6 @@ function saveState(state) {
 
 function escapeSql(value) {
   return String(value).replace(/'/g, "''");
-}
-
-// Batched in chunks of 100 - Monday's root-level items(ids:) query hard-caps at 100 IDs per call,
-// AND defaults its page size to 25 when `limit` isn't explicitly passed (see docs/spec.md
-// decision 22 for the full incident writeup on both bugs).
-async function getPlanningIndicators(itemIds) {
-  if (itemIds.length === 0) return {};
-  const map = {};
-  for (const batch of chunk(itemIds, 100)) {
-    const data = await mondayGraphQL(
-      `
-      query ($itemIds: [ID!]) {
-        items(ids: $itemIds, limit: 100) {
-          id
-          column_values(ids: ["${COL_PLANNING_INDICATOR}"]) {
-            text
-          }
-        }
-      }
-      `,
-      { itemIds: batch },
-    );
-    for (const item of data.items) {
-      map[item.id] = item.column_values[0]?.text;
-    }
-  }
-  return map;
 }
 
 // --- Feature 1: Add to NuOrder -> Remove -------------------------------------------------
@@ -457,18 +425,21 @@ async function main() {
   console.log('Fetching Wholesale WIP items...');
   const wipItems = await getWholesaleWipItems();
 
-  const candidates = wipItems.filter((i) => !i.reworkAlertSent && i.wip2027Id);
+  const candidates = wipItems.filter((i) => !i.reworkAlertSent);
 
   if (candidates.length === 0) {
-    console.log('Nothing to check for drops - no unprocessed items with a linked WIP2027 item.');
+    console.log('Nothing to check for drops - no unprocessed items.');
     saveState(state);
     console.log('Done.');
     return;
   }
 
-  console.log(`Checking Planning Indicator on WIP2027 for ${candidates.length} linked item(s)...`);
-  const indicators = await getPlanningIndicators(candidates.map((c) => c.wip2027Id));
-  const droppedItems = candidates.filter((c) => indicators[c.wip2027Id] === 'Dropped');
+  // CHANGED 2026-09-23 (Shelly's request): trigger now reads WHSL Planning Indicator
+  // (color_mm79m1dk) directly off Wholesale WIP - already fetched above in getWholesaleWipItems()
+  // - instead of WIP2027's status_1__1 via the board_relation link. "Newly Dropped" still means
+  // "currently Dropped AND the Rework Alert Sent checkbox isn't checked yet" (that checkbox is
+  // the idempotency check - see markReworkAlertSent() below), same semantics as before.
+  const droppedItems = candidates.filter((c) => c.planningIndicator === 'Dropped');
   console.log(`${droppedItems.length} item(s) newly Dropped.`);
 
   // Aggregate every matching line across ALL dropped styles found in this run, grouped by
