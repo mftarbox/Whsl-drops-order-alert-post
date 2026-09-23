@@ -16,7 +16,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mondayGraphQL, mondayUploadFile, getAssets } from './lib/monday.js';
+import { mondayGraphQL, mondayUploadFile, getAssets, findItemByExactName } from './lib/monday.js';
 import { runSuiteQL, getRecord, getSalesOrderLines } from './lib/netsuite.js';
 import { sendSlackAlert } from './lib/slack.js';
 import { sendEmail } from './lib/email.js';
@@ -385,6 +385,16 @@ function buildCloseItemsCsv(rows) {
 
 async function createSalesOpsCsvPulse(masterSku, csvRows) {
   const itemName = `${masterSku} dropped - Close items on Sales Orders`;
+
+  // Added 2026-09-23 (Shelly's request): guard against duplicate pulses on re-runs - see
+  // findItemByExactName in lib/monday.js for why this checks the live board instead of just
+  // trusting the "Rework Alert Sent" checkbox.
+  const existing = await findItemByExactName(SALES_OPS_BOARD, itemName);
+  if (existing) {
+    console.log(`  Sales Ops L10 pulse already exists for "${masterSku}" (item ${existing.id}) - skipping duplicate.`);
+    return existing.id;
+  }
+
   const columnValues = {
     [SALES_OPS_PRIORITY_COLUMN]: { label: SALES_OPS_PRIORITY_HIGH_LABEL },
   };
@@ -579,6 +589,16 @@ function computeCatalogRemovalDueDate() {
 
 async function createCatalogRemovalPulse(item) {
   const itemName = `Remove ${item.productType || '(no product type)'} - ${item.printTitle || '(no print title)'} - ${item.masterSku}`;
+
+  // Added 2026-09-23 (Shelly's request): guard against duplicate pulses on re-runs - see
+  // findItemByExactName in lib/monday.js for why this checks the live board instead of just
+  // trusting the "Rework Alert Sent" checkbox.
+  const existing = await findItemByExactName(CATALOG_BOARD, itemName);
+  if (existing) {
+    console.log(`  Catalog removal pulse already exists ("${itemName}", item ${existing.id}) - skipping duplicate.`);
+    return;
+  }
+
   const dueDate = computeCatalogRemovalDueDate();
   const data = await mondayGraphQL(
     `

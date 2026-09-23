@@ -1,9 +1,34 @@
-// Minimal Slack Incoming Webhook client for error alerts to #whsl_ops_workflow_alerts.
+// Minimal Slack Incoming Webhook client. Two independent uses, two independent webhooks:
+//   - sendSlackAlert: error/fatal alerts to #whsl_ops_workflow_alerts (SLACK_ALERTS_WEBHOOK_URL).
+//   - sendSlackBlocks: the Feature 3 drop digest to #wholesale-drops (WHOLESALE_DROPS_SLACK_WEBHOOK_URL).
+// Slack Incoming Webhooks are bound to one fixed channel at creation, so a second destination
+// channel needs its own webhook URL/secret rather than a runtime parameter - see
+// WHOLESALE_DROPS_SLACK_WEBHOOK_URL below.
 //
-// This must never throw - a Slack outage or misconfigured webhook should never be able to take
-// down the actual automation run. Failures here are only ever logged to the console.
+// Neither function should ever throw - a Slack outage or misconfigured webhook should never be
+// able to take down the actual automation run. Failures here are only ever logged to the console.
 
-const WEBHOOK_URL = process.env.SLACK_ALERTS_WEBHOOK_URL;
+const ALERTS_WEBHOOK_URL = process.env.SLACK_ALERTS_WEBHOOK_URL;
+const DROPS_WEBHOOK_URL = process.env.WHOLESALE_DROPS_SLACK_WEBHOOK_URL;
+
+async function postToSlackWebhook(webhookUrl, payload, { envVarName, label }) {
+  if (!webhookUrl) {
+    console.warn(`${envVarName} not set - skipping ${label}.`);
+    return;
+  }
+  try {
+    const res = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) {
+      console.warn(`${label} POST failed (${res.status}): ${await res.text()}`);
+    }
+  } catch (err) {
+    console.warn(`${label} failed to send: ${err.message}`);
+  }
+}
 
 // fatal: true = the whole run is aborting because of this. fatal: false = a single item/order
 // failed and was skipped, but the run is continuing. Shelly asked for alerts on both tiers
@@ -14,24 +39,20 @@ const WEBHOOK_URL = process.env.SLACK_ALERTS_WEBHOOK_URL;
 // 25). Defaults to the original combined workflow's name so nothing breaks if some caller doesn't
 // pass one, but every current caller does.
 export async function sendSlackAlert(message, { fatal = false, source = 'Wholesale Drops Order Alert' } = {}) {
-  if (!WEBHOOK_URL) {
-    console.warn('SLACK_ALERTS_WEBHOOK_URL not set - skipping Slack alert. Message was:', message);
-    return;
-  }
-
   const prefix = fatal ? ':red_circle: *FATAL ERROR*' : ':warning: *Error*';
   const text = `${prefix} - ${source} workflow\n${message}`;
+  await postToSlackWebhook(ALERTS_WEBHOOK_URL, { text }, { envVarName: 'SLACK_ALERTS_WEBHOOK_URL', label: 'Slack alert' });
+}
 
-  try {
-    const res = await fetch(WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-    });
-    if (!res.ok) {
-      console.warn(`Slack alert POST failed (${res.status}): ${await res.text()}`);
-    }
-  } catch (err) {
-    console.warn(`Slack alert failed to send: ${err.message}`);
-  }
+// Added 2026-09-23 (Shelly's request) for Feature 3: posts a Block Kit message - built by the
+// caller (see buildDropDigestSlackBlocks in dropped-alert.js) - to #wholesale-drops instead of the
+// error-alerts channel. `text` is the required Block Kit fallback/notification text, `blocks` is
+// the full block array (already chunked to <=50 blocks per call by the caller, since Slack rejects
+// a single message with more than that).
+export async function sendSlackBlocks(text, blocks) {
+  await postToSlackWebhook(
+    DROPS_WEBHOOK_URL,
+    { text, blocks },
+    { envVarName: 'WHOLESALE_DROPS_SLACK_WEBHOOK_URL', label: 'drop digest Slack post' },
+  );
 }
