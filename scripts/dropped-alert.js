@@ -43,6 +43,7 @@ const COL_WIP2027_IMAGE = 'files2__1'; // WIP2027's real Image column
 
 const CATALOG_BOARD = 18381819120; // "Wholesale Catalog/NuOrder L10"
 const CATALOG_REMOVE_GROUP = 'group_mkxssj5e'; // "Catalog Changes/Updates"
+const CATALOG_DUE_DATE_COLUMN = 'date4'; // "Due Date"
 
 const SALES_OPS_BOARD = 7017226460;
 const SALES_OPS_GROUP = 'new_group72329__1'; // "ToDo"
@@ -551,19 +552,48 @@ async function sendDropDigestEmail(entries) {
 
 // --- Feature 4: "Remove" pulse on the Wholesale Catalog/NuOrder L10 board ----------------
 // New 2026-09-23 (Shelly's request). Same unconditional-per-drop timing as Feature 1/3. One pulse
-// per dropped Wholesale WIP item, created under "Catalog Changes/Updates" - no column values set,
-// just the item name in the exact format Shelly specified.
+// per dropped Wholesale WIP item, created under "Catalog Changes/Updates", named in the exact
+// format Shelly specified, with a Due Date set per her rule: 2 calendar days out from creation,
+// pulled off weekends - a Saturday landing moves back to Friday, a Sunday landing moves forward
+// to Monday. Computed in Mountain time to match the rest of this workflow's date handling.
+function computeCatalogRemovalDueDate() {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'America/Denver',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const y = Number(parts.find((p) => p.type === 'year').value);
+  const m = Number(parts.find((p) => p.type === 'month').value);
+  const d = Number(parts.find((p) => p.type === 'day').value);
+
+  const due = new Date(Date.UTC(y, m - 1, d));
+  due.setUTCDate(due.getUTCDate() + 2);
+
+  const dayOfWeek = due.getUTCDay(); // 0 = Sunday, 6 = Saturday
+  if (dayOfWeek === 6) due.setUTCDate(due.getUTCDate() - 1); // Saturday -> Friday
+  else if (dayOfWeek === 0) due.setUTCDate(due.getUTCDate() + 1); // Sunday -> Monday
+
+  return due.toISOString().slice(0, 10); // YYYY-MM-DD, what Monday's date column expects
+}
+
 async function createCatalogRemovalPulse(item) {
   const itemName = `Remove ${item.productType || '(no product type)'} - ${item.printTitle || '(no print title)'} - ${item.masterSku}`;
+  const dueDate = computeCatalogRemovalDueDate();
   const data = await mondayGraphQL(
     `
-    mutation ($boardId: ID!, $groupId: String!, $itemName: String!) {
-      create_item(board_id: $boardId, group_id: $groupId, item_name: $itemName) { id }
+    mutation ($boardId: ID!, $groupId: String!, $itemName: String!, $columnValues: JSON!) {
+      create_item(board_id: $boardId, group_id: $groupId, item_name: $itemName, column_values: $columnValues) { id }
     }
     `,
-    { boardId: CATALOG_BOARD, groupId: CATALOG_REMOVE_GROUP, itemName },
+    {
+      boardId: CATALOG_BOARD,
+      groupId: CATALOG_REMOVE_GROUP,
+      itemName,
+      columnValues: JSON.stringify({ [CATALOG_DUE_DATE_COLUMN]: { date: dueDate } }),
+    },
   );
-  console.log(`  Created catalog removal pulse ${data.create_item.id} ("${itemName}").`);
+  console.log(`  Created catalog removal pulse ${data.create_item.id} ("${itemName}", due ${dueDate}).`);
 }
 
 async function main() {
