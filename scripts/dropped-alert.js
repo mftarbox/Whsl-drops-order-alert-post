@@ -16,9 +16,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mondayGraphQL, mondayUploadFile } from './lib/monday.js';
+import { mondayGraphQL, mondayUploadFile, getAssets } from './lib/monday.js';
 import { runSuiteQL, getRecord, getSalesOrderLines } from './lib/netsuite.js';
 import { sendSlackAlert } from './lib/slack.js';
+import { sendEmail } from './lib/email.js';
 import { isManualRun, isEightPmMountain } from './lib/schedule.js';
 import { getWholesaleWipItems, WHOLESALE_WIP_BOARD, COL_ADD_TO_NUORDER, COL_REWORK_CHECKBOX } from './lib/wholesale-wip.js';
 
@@ -30,6 +31,18 @@ const STATE_PATH = path.join(__dirname, '..', 'state', 'state.json');
 const L10_BOARD = 3552781534;
 const L10_GROUP = 'group_mm1mrkqe'; // "Customer Drops Communication Needed"
 const L10_PERSON_COLUMN = 'person';
+
+// Added 2026-09-23 (Shelly's request) for Feature 3 (drop digest email image) below. NOTE: this
+// re-introduces WIP2027_BOARD, which was removed from this file earlier in the same round of
+// changes when the Planning Indicator trigger moved off WIP2027 entirely - that removal still
+// stands (Planning Indicator no longer touches WIP2027 at all). This constant is back for an
+// unrelated reason: WIP2027 is still the only place a real, readable Image field exists (see
+// lib/wholesale-wip.js) - Wholesale WIP's own Image column is a read-only mirror of it.
+const WIP2027_BOARD = 18388071004;
+const COL_WIP2027_IMAGE = 'files2__1'; // WIP2027's real Image column
+
+const CATALOG_BOARD = 18381819120; // "Wholesale Catalog/NuOrder L10"
+const CATALOG_REMOVE_GROUP = 'group_mkxssj5e'; // "Catalog Changes/Updates"
 
 const SALES_OPS_BOARD = 7017226460;
 const SALES_OPS_GROUP = 'new_group72329__1'; // "ToDo"
@@ -412,6 +425,147 @@ async function createSalesOpsCsvPulse(masterSku, csvRows) {
   return pulseId;
 }
 
+// --- Feature 3: Dropped-styles digest email ----------------------------------------------
+// New 2026-09-23 (Shelly's request). Unconditional side effect of a drop, same timing as Feature
+// 1 - fires for every Wholesale WIP item newly marked Dropped in a run, independent of whether it
+// also matched any NetSuite orders. One email per RUN (not per item/order), listing everything
+// dropped, grouped under a header per Product Type, sent to the full "Is Inside Rep" distribution
+// list - queried fresh from NetSuite every run (rather than a static list) so it always reflects
+// whoever currently holds that flag. Default sort (not specified by Shelly - flag if wrong):
+// Product Type headers alphabetical, items within a group alphabetical by Print Title.
+async function getInsideRepEmails() {
+  const sql = `
+    SELECT email
+    FROM employee
+    WHERE custentity_shin_inside_rep = 'T'
+      AND isinactive = 'F'
+      AND email IS NOT NULL
+  `;
+  const rows = await runSuiteQL(sql);
+  return rows.map((r) => r.email).filter(Boolean);
+}
+
+// Pulls the first image (if any) off WIP2027's real Image column for inline embedding in the
+// digest email - one product photo per line, not the full gallery. Mirrors the same file-list
+// parsing nuorder-imagery-export.js uses for this column. Returns null (email just omits the
+// image for that item) on no linked WIP2027 item, no image, or any fetch failure - a missing
+// photo shouldn't block the email from going out.
+async function getDropImageAttachment(wip2027Id, masterSku) {
+  if (!wip2027Id) return null;
+  try {
+    const data = await mondayGraphQL(
+      `
+      query ($itemId: ID!) {
+        items(ids: [$itemId]) {
+          column_values(ids: ["${COL_WIP2027_IMAGE}"]) { value }
+        }
+      }
+      `,
+      { itemId: wip2027Id },
+    );
+    const raw = data.items?.[0]?.column_values?.[0]?.value;
+    const files = raw ? JSON.parse(raw).files || [] : [];
+    if (files.length === 0) return null;
+
+    const [asset] = await getAssets([String(files[0].assetId)]);
+    if (!asset) return null;
+
+    const res = await fetch(asset.public_url);
+    if (!res.ok) return null;
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const cid = `drop-image-${masterSku}@wholesale-alert`;
+    return { cid, filename: asset.name || `${masterSku}${asset.file_extension || ''}`, content: buffer };
+  } catch (err) {
+    console.warn(`  Could not fetch drop image for Master SKU ${masterSku}: ${err.message}`);
+    return null;
+  }
+}
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function buildDropDigestHtml(entries) {
+  const groups = new Map();
+  for (const entry of entries) {
+    const key = entry.productType || 'Uncategorized';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(entry);
+  }
+
+  const sections = [...groups.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([productType, items]) => {
+      const rows = [...items]
+        .sort((a, b) => (a.printTitle || '').localeCompare(b.printTitle || ''))
+        .map((item) => {
+          const img = item.attachment
+            ? `<img src="cid:${item.attachment.cid}" alt="${escapeHtml(item.printTitle || item.masterSku)}" width="120" style="display:block;margin-bottom:6px;border:1px solid #ddd;">`
+            : '';
+          return `
+            <tr>
+              <td style="padding:12px 16px;border-bottom:1px solid #eee;">
+                ${img}
+                <div><b>${escapeHtml(item.masterSku)}</b></div>
+                <div>${escapeHtml(item.printTitle || '(no print title on file)')}</div>
+              </td>
+            </tr>`;
+        })
+        .join('');
+      return `
+        <h3 style="margin:24px 0 8px;">${escapeHtml(productType)}</h3>
+        <table style="border-collapse:collapse;width:100%;max-width:480px;">${rows}</table>`;
+    })
+    .join('');
+
+  return `
+    <div style="font-family:Arial,sans-serif;color:#222;">
+      <p>The following styles dropped in today's run:</p>
+      ${sections}
+    </div>`;
+}
+
+async function sendDropDigestEmail(entries) {
+  const recipients = await getInsideRepEmails();
+  if (recipients.length === 0) {
+    console.warn('  No active "Is Inside Rep" employees found with an email on file - skipping digest email.');
+    return;
+  }
+  const html = buildDropDigestHtml(entries);
+  const attachments = entries.map((e) => e.attachment).filter(Boolean);
+  const dateLabel = new Date().toLocaleDateString('en-US', {
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    timeZone: 'America/Denver',
+  });
+
+  await sendEmail({
+    to: recipients,
+    subject: `Wholesale Drops – ${dateLabel}`,
+    html,
+    attachments,
+  });
+  console.log(`  Sent drop digest email to ${recipients.length} inside rep(s).`);
+}
+
+// --- Feature 4: "Remove" pulse on the Wholesale Catalog/NuOrder L10 board ----------------
+// New 2026-09-23 (Shelly's request). Same unconditional-per-drop timing as Feature 1/3. One pulse
+// per dropped Wholesale WIP item, created under "Catalog Changes/Updates" - no column values set,
+// just the item name in the exact format Shelly specified.
+async function createCatalogRemovalPulse(item) {
+  const itemName = `Remove ${item.productType || '(no product type)'} - ${item.printTitle || '(no print title)'} - ${item.masterSku}`;
+  const data = await mondayGraphQL(
+    `
+    mutation ($boardId: ID!, $groupId: String!, $itemName: String!) {
+      create_item(board_id: $boardId, group_id: $groupId, item_name: $itemName) { id }
+    }
+    `,
+    { boardId: CATALOG_BOARD, groupId: CATALOG_REMOVE_GROUP, itemName },
+  );
+  console.log(`  Created catalog removal pulse ${data.create_item.id} ("${itemName}").`);
+}
+
 async function main() {
   if (!isManualRun() && !isEightPmMountain()) {
     // This cron fires twice a day (once for MST, once for MDT) so it always lands on 8pm
@@ -447,6 +601,7 @@ async function main() {
   // one combined comment instead of two separate ones (per Shelly's call on 2026-08-07).
   const orderMatches = new Map();
   const lineQueueCache = new Map(); // so_internal_id -> Map(item_id -> [line, ...]), see Feature 2
+  const digestEntries = []; // one entry per dropped item, for the end-of-run Feature 3 email
 
   for (const item of droppedItems) {
     console.log(`Processing dropped style: ${item.name} (Master SKU ${item.masterSku || '(none)'})`);
@@ -458,6 +613,21 @@ async function main() {
     } catch (err) {
       console.error(`  Failed to set "Add to NuOrder" to Remove on ${item.name}: ${err.message}`);
       await sendSlackAlert(`Failed to set "Add to NuOrder" to Remove on "${item.name}": ${err.message}`, { source: SOURCE });
+    }
+
+    // --- Feature 3 accumulator + Feature 4: both unconditional, same timing as Feature 1 ---
+    digestEntries.push({
+      masterSku: item.masterSku,
+      printTitle: item.printTitle,
+      productType: item.productType,
+      attachment: await getDropImageAttachment(item.wip2027Id, item.masterSku),
+    });
+
+    try {
+      await createCatalogRemovalPulse(item);
+    } catch (err) {
+      console.error(`  Failed to create catalog removal pulse for ${item.name}: ${err.message}`);
+      await sendSlackAlert(`Failed to create catalog removal pulse for "${item.name}": ${err.message}`, { source: SOURCE });
     }
 
     if (!item.masterSku) {
@@ -528,6 +698,16 @@ async function main() {
     } catch (err) {
       console.error(`  Failed to check "Rework Alert Sent" on ${item.name}: ${err.message}`);
       await sendSlackAlert(`Failed to check "Rework Alert Sent" on "${item.name}": ${err.message}`, { source: SOURCE });
+    }
+  }
+
+  // --- Feature 3: one digest email for the whole run, not per item ---
+  if (digestEntries.length > 0) {
+    try {
+      await sendDropDigestEmail(digestEntries);
+    } catch (err) {
+      console.error(`  Failed to send drop digest email: ${err.message}`);
+      await sendSlackAlert(`Failed to send drop digest email: ${err.message}`, { source: SOURCE });
     }
   }
 

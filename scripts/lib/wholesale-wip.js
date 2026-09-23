@@ -23,6 +23,12 @@ export const COL_ADD_TO_NUORDER = 'color_mm5zz20q'; // Wholesale WIP "Add to NuO
 // real files2__1 field instead.
 export const COL_PLANNING_INDICATOR = 'color_mm79m1dk'; // Wholesale WIP "WHSL Planning Indicator" (native status)
 
+// Added 2026-09-23 (Shelly's request) for the dropped-styles digest email + Catalog/NuOrder L10
+// "Remove" pulse features in dropped-alert.js - both native text columns living directly on
+// Wholesale WIP, no WIP2027 link or NetSuite lookup needed for either.
+export const COL_PRODUCT_TYPE = 'text_mm4mg5an'; // Wholesale WIP "Product Type"
+export const COL_PRINT_TITLE = 'text_mm4mef1k'; // Wholesale WIP "Print Title"
+
 export function isChecked(checkboxColumnValue) {
   if (!checkboxColumnValue) return false;
   if (typeof checkboxColumnValue.checked === 'boolean') return checkboxColumnValue.checked;
@@ -48,7 +54,15 @@ export function chunk(array, size) {
 // 10471-3191) was missed this way. Fixed to page through the full board via items_page's cursor
 // until exhausted. See docs/spec.md decision 22 for the full incident writeup.
 export async function getWholesaleWipItems() {
-  const columnIds = [COL_BOARD_RELATION, COL_MASTER_SKU, COL_REWORK_CHECKBOX, COL_ADD_TO_NUORDER, COL_PLANNING_INDICATOR];
+  const columnIds = [
+    COL_BOARD_RELATION,
+    COL_MASTER_SKU,
+    COL_REWORK_CHECKBOX,
+    COL_ADD_TO_NUORDER,
+    COL_PLANNING_INDICATOR,
+    COL_PRODUCT_TYPE,
+    COL_PRINT_TITLE,
+  ];
   const rawItems = [];
   let cursor = null;
 
@@ -113,6 +127,8 @@ export async function getWholesaleWipItems() {
       reworkAlertSent: isChecked(cv[COL_REWORK_CHECKBOX]),
       addToNuOrder: cv[COL_ADD_TO_NUORDER]?.text || null,
       planningIndicator: cv[COL_PLANNING_INDICATOR]?.text || null,
+      productType: cv[COL_PRODUCT_TYPE]?.text || null,
+      printTitle: cv[COL_PRINT_TITLE]?.text || null,
     };
   });
 }
