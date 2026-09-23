@@ -18,8 +18,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { mondayGraphQL, mondayUploadFile, getAssets, findItemByExactName } from './lib/monday.js';
 import { runSuiteQL, getRecord, getSalesOrderLines } from './lib/netsuite.js';
-import { sendSlackAlert } from './lib/slack.js';
-import { sendEmail } from './lib/email.js';
+import { sendSlackAlert, sendSlackBlocks } from './lib/slack.js';
 import { isManualRun, isEightPmMountain } from './lib/schedule.js';
 import { getWholesaleWipItems, WHOLESALE_WIP_BOARD, COL_ADD_TO_NUORDER, COL_REWORK_CHECKBOX } from './lib/wholesale-wip.js';
 
@@ -32,7 +31,7 @@ const L10_BOARD = 3552781534;
 const L10_GROUP = 'group_mm1mrkqe'; // "Customer Drops Communication Needed"
 const L10_PERSON_COLUMN = 'person';
 
-// Added 2026-09-23 (Shelly's request) for Feature 3 (drop digest email image) below. NOTE: this
+// Added 2026-09-23 (Shelly's request) for Feature 3 (drop digest Slack image) below. NOTE: this
 // re-introduces WIP2027_BOARD, which was removed from this file earlier in the same round of
 // changes when the Planning Indicator trigger moved off WIP2027 entirely - that removal still
 // stands (Planning Indicator no longer touches WIP2027 at all). This constant is back for an
@@ -386,9 +385,10 @@ function buildCloseItemsCsv(rows) {
 async function createSalesOpsCsvPulse(masterSku, csvRows) {
   const itemName = `${masterSku} dropped - Close items on Sales Orders`;
 
-  // Added 2026-09-23 (Shelly's request): guard against duplicate pulses on re-runs - see
-  // findItemByExactName in lib/monday.js for why this checks the live board instead of just
-  // trusting the "Rework Alert Sent" checkbox.
+  // Added 2026-09-23 (Shelly's request): skip creating a second pulse if one with this exact
+  // name already exists on the board - guards against a partial failure on a previous run (e.g.
+  // the "Rework Alert Sent" checkbox update failing after this pulse already got created) leaving
+  // the item looking unprocessed and re-creating the pulse on the next run.
   const existing = await findItemByExactName(SALES_OPS_BOARD, itemName);
   if (existing) {
     console.log(`  Sales Ops L10 pulse already exists for "${masterSku}" (item ${existing.id}) - skipping duplicate.`);
@@ -436,32 +436,27 @@ async function createSalesOpsCsvPulse(masterSku, csvRows) {
   return pulseId;
 }
 
-// --- Feature 3: Dropped-styles digest email ----------------------------------------------
-// New 2026-09-23 (Shelly's request). Unconditional side effect of a drop, same timing as Feature
-// 1 - fires for every Wholesale WIP item newly marked Dropped in a run, independent of whether it
-// also matched any NetSuite orders. One email per RUN (not per item/order), listing everything
-// dropped, grouped under a header per Product Type, sent to the full "Is Inside Rep" distribution
-// list - queried fresh from NetSuite every run (rather than a static list) so it always reflects
-// whoever currently holds that flag. Default sort (not specified by Shelly - flag if wrong):
-// Product Type headers alphabetical, items within a group alphabetical by Print Title.
-async function getInsideRepEmails() {
-  const sql = `
-    SELECT email
-    FROM employee
-    WHERE custentity_shin_inside_rep = 'T'
-      AND isinactive = 'F'
-      AND email IS NOT NULL
-  `;
-  const rows = await runSuiteQL(sql);
-  return rows.map((r) => r.email).filter(Boolean);
+// --- Feature 3: Dropped-styles digest Slack post ------------------------------------------
+// New 2026-09-23 (Shelly's request). Originally built as an email to the "Is Inside Rep"
+// distribution list, but Google Workspace's org-wide policy blocks Gmail SMTP app-password auth
+// for any mailbox (confirmed via a live test run failure), so Shelly asked to drop email entirely
+// and post to the #wholesale-drops Slack channel instead. Unconditional side effect of a drop,
+// same timing as Feature 1 - fires for every Wholesale WIP item newly marked Dropped in a run,
+// independent of whether it also matched any NetSuite orders. One Slack post per RUN (not per
+// item/order), listing everything dropped, grouped under a header per Product Type. Default sort
+// (not specified by Shelly - flag if wrong): Product Type headers alphabetical, items within a
+// group alphabetical by Print Title.
+function escapeSlackText(value) {
+  return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-// Pulls the first image (if any) off WIP2027's real Image column for inline embedding in the
-// digest email - one product photo per line, not the full gallery. Mirrors the same file-list
-// parsing nuorder-imagery-export.js uses for this column. Returns null (email just omits the
-// image for that item) on no linked WIP2027 item, no image, or any fetch failure - a missing
-// photo shouldn't block the email from going out.
-async function getDropImageAttachment(wip2027Id, masterSku) {
+// Pulls the first image (if any) off WIP2027's real Image column for inline display in the
+// digest Slack post - one product photo per item, not the full gallery. Mirrors the same
+// file-list parsing nuorder-imagery-export.js uses for this column. Returns null (Slack just
+// omits the image for that item) on no linked WIP2027 item, no image, or any fetch failure - a
+// missing photo shouldn't block the digest from going out. Unlike the old email attachment
+// version, this just needs the presigned URL (Slack fetches it directly) - no download/re-upload.
+async function getDropImageUrl(wip2027Id) {
   if (!wip2027Id) return null;
   try {
     const data = await mondayGraphQL(
@@ -479,24 +474,14 @@ async function getDropImageAttachment(wip2027Id, masterSku) {
     if (files.length === 0) return null;
 
     const [asset] = await getAssets([String(files[0].assetId)]);
-    if (!asset) return null;
-
-    const res = await fetch(asset.public_url);
-    if (!res.ok) return null;
-    const buffer = Buffer.from(await res.arrayBuffer());
-    const cid = `drop-image-${masterSku}@wholesale-alert`;
-    return { cid, filename: asset.name || `${masterSku}${asset.file_extension || ''}`, content: buffer };
+    return asset?.public_url || null;
   } catch (err) {
-    console.warn(`  Could not fetch drop image for Master SKU ${masterSku}: ${err.message}`);
+    console.warn(`  Could not fetch drop image URL (WIP2027 item ${wip2027Id}): ${err.message}`);
     return null;
   }
 }
 
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-
-function buildDropDigestHtml(entries) {
+function buildDropDigestSlackBlocks(entries) {
   const groups = new Map();
   for (const entry of entries) {
     const key = entry.productType || 'Uncategorized';
@@ -504,60 +489,51 @@ function buildDropDigestHtml(entries) {
     groups.get(key).push(entry);
   }
 
-  const sections = [...groups.entries()]
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([productType, items]) => {
-      const rows = [...items]
-        .sort((a, b) => (a.printTitle || '').localeCompare(b.printTitle || ''))
-        .map((item) => {
-          const img = item.attachment
-            ? `<img src="cid:${item.attachment.cid}" alt="${escapeHtml(item.printTitle || item.masterSku)}" width="120" style="display:block;margin-bottom:6px;border:1px solid #ddd;">`
-            : '';
-          return `
-            <tr>
-              <td style="padding:12px 16px;border-bottom:1px solid #eee;">
-                ${img}
-                <div><b>${escapeHtml(item.masterSku)}</b></div>
-                <div>${escapeHtml(item.printTitle || '(no print title on file)')}</div>
-              </td>
-            </tr>`;
-        })
-        .join('');
-      return `
-        <h3 style="margin:24px 0 8px;">${escapeHtml(productType)}</h3>
-        <table style="border-collapse:collapse;width:100%;max-width:480px;">${rows}</table>`;
-    })
-    .join('');
+  const blocks = [];
+  for (const productType of [...groups.keys()].sort((a, b) => a.localeCompare(b))) {
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text: `*${escapeSlackText(productType)}*` } });
 
-  return `
-    <div style="font-family:Arial,sans-serif;color:#222;">
-      <p>The following styles dropped in today's run:</p>
-      ${sections}
-    </div>`;
+    const items = [...groups.get(productType)].sort((a, b) => (a.printTitle || '').localeCompare(b.printTitle || ''));
+    for (const item of items) {
+      const section = {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `*${escapeSlackText(item.masterSku)}*\n${escapeSlackText(item.printTitle || '(no print title on file)')}`,
+        },
+      };
+      if (item.imageUrl) {
+        section.accessory = { type: 'image', image_url: item.imageUrl, alt_text: item.printTitle || item.masterSku };
+      }
+      blocks.push(section);
+    }
+    blocks.push({ type: 'divider' });
+  }
+  if (blocks.length && blocks[blocks.length - 1].type === 'divider') blocks.pop();
+
+  return blocks;
 }
 
-async function sendDropDigestEmail(entries) {
-  const recipients = await getInsideRepEmails();
-  if (recipients.length === 0) {
-    console.warn('  No active "Is Inside Rep" employees found with an email on file - skipping digest email.');
-    return;
-  }
-  const html = buildDropDigestHtml(entries);
-  const attachments = entries.map((e) => e.attachment).filter(Boolean);
+// Slack caps a single message at 50 Block Kit blocks, so a large drop run is chunked into
+// multiple posts - only the first chunk gets the header block, so the digest still reads as one
+// contiguous list in the channel.
+async function sendDropDigestToSlack(entries) {
   const dateLabel = new Date().toLocaleDateString('en-US', {
     year: 'numeric',
     month: 'long',
     day: 'numeric',
     timeZone: 'America/Denver',
   });
+  const headerText = `Wholesale Drops – ${dateLabel}`;
+  const bodyBlocks = buildDropDigestSlackBlocks(entries);
 
-  await sendEmail({
-    to: recipients,
-    subject: `Wholesale Drops – ${dateLabel}`,
-    html,
-    attachments,
-  });
-  console.log(`  Sent drop digest email to ${recipients.length} inside rep(s).`);
+  const CHUNK_SIZE = 49;
+  for (let i = 0; i < bodyBlocks.length; i += CHUNK_SIZE) {
+    const chunk = bodyBlocks.slice(i, i + CHUNK_SIZE);
+    const blocks = i === 0 ? [{ type: 'header', text: { type: 'plain_text', text: headerText } }, ...chunk] : chunk;
+    await sendSlackBlocks(headerText, blocks);
+  }
+  console.log(`  Posted drop digest to #wholesale-drops (${entries.length} item(s)).`);
 }
 
 // --- Feature 4: "Remove" pulse on the Wholesale Catalog/NuOrder L10 board ----------------
@@ -590,9 +566,8 @@ function computeCatalogRemovalDueDate() {
 async function createCatalogRemovalPulse(item) {
   const itemName = `Remove ${item.productType || '(no product type)'} - ${item.printTitle || '(no print title)'} - ${item.masterSku}`;
 
-  // Added 2026-09-23 (Shelly's request): guard against duplicate pulses on re-runs - see
-  // findItemByExactName in lib/monday.js for why this checks the live board instead of just
-  // trusting the "Rework Alert Sent" checkbox.
+  // Added 2026-09-23 (Shelly's request): same duplicate guard as createSalesOpsCsvPulse above -
+  // see that comment for why.
   const existing = await findItemByExactName(CATALOG_BOARD, itemName);
   if (existing) {
     console.log(`  Catalog removal pulse already exists ("${itemName}", item ${existing.id}) - skipping duplicate.`);
@@ -670,7 +645,7 @@ async function main() {
       masterSku: item.masterSku,
       printTitle: item.printTitle,
       productType: item.productType,
-      attachment: await getDropImageAttachment(item.wip2027Id, item.masterSku),
+      imageUrl: await getDropImageUrl(item.wip2027Id),
     });
 
     try {
@@ -751,13 +726,13 @@ async function main() {
     }
   }
 
-  // --- Feature 3: one digest email for the whole run, not per item ---
+  // --- Feature 3: one digest Slack post for the whole run, not per item ---
   if (digestEntries.length > 0) {
     try {
-      await sendDropDigestEmail(digestEntries);
+      await sendDropDigestToSlack(digestEntries);
     } catch (err) {
-      console.error(`  Failed to send drop digest email: ${err.message}`);
-      await sendSlackAlert(`Failed to send drop digest email: ${err.message}`, { source: SOURCE });
+      console.error(`  Failed to post drop digest to Slack: ${err.message}`);
+      await sendSlackAlert(`Failed to post drop digest to Slack: ${err.message}`, { source: SOURCE });
     }
   }
 
